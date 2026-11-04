@@ -13,8 +13,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 from typing import Any
 
+from thermopilot.hitl.switch import SwitchApprovalDesk
 from thermopilot.planner.planner import RecoveryPlanner
 from thermopilot.schemas import GPUTelemetry, WorkloadSpec
 from thermopilot.switch_adapter.base import BaseSwitchAdapter
@@ -25,6 +27,8 @@ from thermopilot.switch_adapter.client import (
 from thermopilot.switch_adapter.config import SwitchAdapterConfig
 from thermopilot.switch_adapter.messages import (
     ADVISORY_FOOTER,
+    DecisionCardItem,
+    DecisionCardPayload,
     NegotiationCompletePayload,
     RecoveryCandidateItem,
     RecoveryProposalPayload,
@@ -46,12 +50,18 @@ class PlannerSwitchAdapter(BaseSwitchAdapter):
         self,
         config: SwitchAdapterConfig,
         planner: RecoveryPlanner | None = None,
+        desk: SwitchApprovalDesk | None = None,
         http_client: SwitchHttpClient | None = None,
         ws_client: SwitchWebSocketClient | None = None,
     ) -> None:
         super().__init__(config, http_client, ws_client)
         self.planner = planner or RecoveryPlanner()
+        self.desk = desk or SwitchApprovalDesk(
+            safety_gate=self.planner.safety_gate,
+            default_timeout_s=self.config.approval_timeout_s,
+        )
         self.processed_incidents: set[str] = set()
+        self.active_incidents: dict[str, dict[str, Any]] = {}
 
     def format_planner_status_reply(self) -> str:
         """Format an informational status card of the recovery planner and SafetyGate."""
@@ -81,9 +91,12 @@ class PlannerSwitchAdapter(BaseSwitchAdapter):
         return "\n".join(lines)
 
     def plan_and_certify(
-        self, bid_payload: WorkloadBidPayload
+        self, bid_payload: WorkloadBidPayload, room_id: str = ""
     ) -> tuple[
-        RecoveryProposalPayload, SafetyResultPayload, NegotiationCompletePayload
+        RecoveryProposalPayload,
+        SafetyResultPayload,
+        NegotiationCompletePayload,
+        DecisionCardPayload,
     ]:
         """Generate candidate plans, run SafetyGate verification, and package outputs."""
         incident_id = bid_payload.incident_id
@@ -208,7 +221,66 @@ class PlannerSwitchAdapter(BaseSwitchAdapter):
             next_step="Awaiting authenticated operator sign-off at Compute Desk (Zero Actuation via Chat)",
         )
 
-        return rec_proposal, safety_result, negotiation_complete
+        # 4. HITL Decision Card via SwitchApprovalDesk
+        card = self.desk.create_and_dispatch_card(
+            incident_id=incident_id,
+            telemetry=telemetry,
+            candidates=planner_result.candidates,
+            workloads=workloads,
+            timeout_s=self.config.approval_timeout_s,
+        )
+
+        card_items: list[DecisionCardItem] = []
+        for p in card.candidate_plans:
+            card_items.append(
+                DecisionCardItem(
+                    plan_id=p.plan_id,
+                    name=p.name,
+                    strategy_type=p.strategy_type.value,
+                    is_recommended=p.is_recommended,
+                    is_safe=p.is_safe,
+                    safety_verdict=p.safety_verdict,
+                    rejection_reasons=list(p.rejection_reasons),
+                    projected_temp_max_c=p.projected_temp_max_c,
+                    projected_power_w=p.projected_power_w,
+                    cooling_time_to_safe_s=p.cooling_time_to_safe_s,
+                    estimated_cost_usd=p.estimated_cost_usd,
+                    sla_violations_expected=p.sla_violations_expected,
+                    actions_summary=", ".join(
+                        f"{a.workload_id}->{a.action.value}"
+                        + (f"({a.target_power_w:.0f}W)" if a.target_power_w is not None else "")
+                        for a in p.proposed_actions
+                    ),
+                    is_executable=p.is_executable,
+                )
+            )
+
+        decision_card = DecisionCardPayload(
+            incident_id=incident_id,
+            severity=card.severity,
+            current_temp_c=card.current_temp_c,
+            current_power_w=card.current_power_w,
+            critical_trip_temp_c=card.critical_trip_temp_c,
+            time_to_trip_s=card.time_to_trip_s,
+            candidate_plans=card_items,
+            executable_plan_ids=list(card.executable_plan_ids),
+            rejected_plan_ids=list(card.rejected_plan_ids),
+            timeout_seconds=card.timeout_seconds,
+            approval_command=f"@planner-agent approve {incident_id} {rec_id}",
+            rejection_command=f"@planner-agent reject {incident_id}",
+        )
+
+        self.active_incidents[incident_id] = {
+            "card": card,
+            "decision_payload": decision_card,
+            "telemetry": telemetry,
+            "workloads": workloads,
+            "candidates": planner_result.candidates,
+            "room_id": room_id,
+            "timestamp": time.time(),
+        }
+
+        return rec_proposal, safety_result, negotiation_complete, decision_card
 
     async def handle_message_event(
         self, event_data: dict[str, Any]
@@ -275,7 +347,9 @@ class PlannerSwitchAdapter(BaseSwitchAdapter):
                     msg.incident_id,
                 )
 
-                rec_prop, saf_res, neg_comp = self.plan_and_certify(msg)
+                rec_prop, saf_res, neg_comp, dec_card = self.plan_and_certify(
+                    msg, room_id=room_id
+                )
 
                 msg1 = format_discord_message(rec_prop)
                 await self.http_client.send_message(room_id=room_id, content=msg1)
@@ -289,7 +363,11 @@ class PlannerSwitchAdapter(BaseSwitchAdapter):
                 msg3 = format_discord_message(neg_comp)
                 await self.http_client.send_message(room_id=room_id, content=msg3)
 
-                return [msg1, msg2, msg3]
+                await asyncio.sleep(0.3)
+                msg4 = format_discord_message(dec_card)
+                await self.http_client.send_message(room_id=room_id, content=msg4)
+
+                return [msg1, msg2, msg3, msg4]
 
             # Ignore other structured inter-agent messages
             return None

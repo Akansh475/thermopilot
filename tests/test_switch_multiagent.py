@@ -410,18 +410,23 @@ class TestSwitchMultiAgent(unittest.IsolatedAsyncioTestCase):
         planner_content = await adapter_p.handle_message_event(planner_event)
         self.assertIsNotNone(planner_content)
         self.assertIsInstance(planner_content, list)
-        self.assertEqual(len(planner_content), 3)
+        self.assertEqual(len(planner_content), 4)
 
-        # Verify 3 messages dispatched by planner: proposal, safety, complete
-        self.assertEqual(mock_http_p.send_message.await_count, 3)
+        # Verify 4 messages dispatched by planner: proposal, safety, complete, decision card
+        self.assertEqual(mock_http_p.send_message.await_count, 4)
 
         msg_proposal = parse_switch_message(planner_content[0])
         msg_safety = parse_switch_message(planner_content[1])
         msg_complete = parse_switch_message(planner_content[2])
+        msg_card = parse_switch_message(planner_content[3])
 
         self.assertIsInstance(msg_proposal, RecoveryProposalPayload)
         self.assertIsInstance(msg_safety, SafetyResultPayload)
         self.assertIsInstance(msg_complete, NegotiationCompletePayload)
+        self.assertIsInstance(msg_card, DecisionCardPayload)
+        self.assertEqual(msg_card.incident_id, alert_msg.incident_id)
+        self.assertIn("PLAN-B", msg_card.executable_plan_ids)
+        self.assertIn("PLAN-D", msg_card.rejected_plan_ids)
 
         # Step 4: Verify SafetyGate certification & unsafe plan rejection
         evaluations = {e.plan_id: e for e in msg_safety.evaluations}
@@ -517,7 +522,9 @@ class TestSwitchMultiAgent(unittest.IsolatedAsyncioTestCase):
         )
 
         adapter_p = PlannerSwitchAdapter(self.cfg_planner, planner=planner)
-        _rec_prop, saf_res, _neg_comp = adapter_p.plan_and_certify(bids)
+        _rec_prop, saf_res, _neg_comp, dec_card = adapter_p.plan_and_certify(bids)
+        self.assertIn("PLAN-D", dec_card.rejected_plan_ids)
+        self.assertIn("PLAN-B", dec_card.executable_plan_ids)
 
         eval_d = next(e for e in saf_res.evaluations if e.plan_id == "PLAN-D")
         self.assertFalse(eval_d.passed)
