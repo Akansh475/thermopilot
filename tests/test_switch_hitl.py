@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 import unittest
 from unittest.mock import AsyncMock
 
@@ -176,17 +177,29 @@ class TestSwitchOperatorAuthorization(unittest.IsolatedAsyncioTestCase):
             incident_id="inc-auth-test",
             proposals=[
                 WorkloadBidItem(
-                    workload_id="wl-alpha",
-                    name="Alpha",
+                    workload_id="wl-alpha-inference",
+                    name="Financial Trading Batch",
                     priority="P0_CRITICAL",
                     current_power_w=250.0,
                     min_power_w=200.0,
                     requested_power_w=220.0,
                     can_preempt=False,
-                    sla_importance_score=0.9,
-                    rationale="Critical",
+                    sla_importance_score=0.98,
+                    rationale="VIP non-preemptible",
                     estimated_trade_off="None",
-                )
+                ),
+                WorkloadBidItem(
+                    workload_id="wl-beta-training",
+                    name="Diffusion Fine-Tuning",
+                    priority="P2_FLEXIBLE",
+                    current_power_w=150.0,
+                    min_power_w=150.0,
+                    requested_power_w=160.0,
+                    can_preempt=True,
+                    sla_importance_score=0.15,
+                    rationale="Elastic batch training",
+                    estimated_trade_off="Can cap or pause",
+                ),
             ],
         )
         self.adapter.plan_and_certify(bids, room_id=self.room_id)
@@ -237,7 +250,8 @@ class TestSwitchOperatorAuthorization(unittest.IsolatedAsyncioTestCase):
         }
         reply = await self.adapter.handle_message_event(event)
         self.assertIsNotNone(reply)
-        self.assertIn("Plan `PLAN-B` Approved by Operator `operator-alice`", reply)
+        self.assertIn("Plan `PLAN-B` Approved and Pre-Execution Certified by SafetyGate", reply)
+        self.assertIn("operator-alice", reply)
 
     async def test_non_approval_mutation_commands_rejected_for_everyone(self) -> None:
         """Raw execution or mitigation commands in chat are blocked even for authorized operators."""
@@ -255,4 +269,119 @@ class TestSwitchOperatorAuthorization(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(reply)
             self.assertIn("Recovery plans cannot be executed from chat", reply)
             self.assertIn("Execution Denied", reply)
+
+
+class TestSwitchTimeoutAndDuplicate(unittest.IsolatedAsyncioTestCase):
+    """Test suite for approval timeout escalation and duplicate protection."""
+
+    def setUp(self) -> None:
+        self.room_id = "test-room-timeout"
+        self.config = SwitchAdapterConfig(
+            agent_id="test-planner-id",
+            api_key="test-planner-key",
+            client_name="planner-agent",
+            allowed_rooms=frozenset({self.room_id}),
+            authorized_operators=frozenset({"operator-alice"}),
+            approval_timeout_s=30.0,
+        )
+        self.mock_http = AsyncMock(spec=SwitchHttpClient)
+        self.adapter = PlannerSwitchAdapter(self.config, http_client=self.mock_http)
+
+    def _seed_incident(self, incident_id: str) -> None:
+        bids = WorkloadBidPayload(
+            incident_id=incident_id,
+            proposals=[
+                WorkloadBidItem(
+                    workload_id="wl-alpha-inference",
+                    name="Financial Trading Batch",
+                    priority="P0_CRITICAL",
+                    current_power_w=250.0,
+                    min_power_w=200.0,
+                    requested_power_w=220.0,
+                    can_preempt=False,
+                    sla_importance_score=0.98,
+                    rationale="VIP non-preemptible",
+                    estimated_trade_off="None",
+                ),
+                WorkloadBidItem(
+                    workload_id="wl-beta-training",
+                    name="Diffusion Fine-Tuning",
+                    priority="P2_FLEXIBLE",
+                    current_power_w=150.0,
+                    min_power_w=150.0,
+                    requested_power_w=160.0,
+                    can_preempt=True,
+                    sla_importance_score=0.15,
+                    rationale="Elastic batch training",
+                    estimated_trade_off="Can cap or pause",
+                ),
+            ],
+        )
+        self.adapter.plan_and_certify(bids, room_id=self.room_id)
+
+    async def test_approval_timeout_escalation(self) -> None:
+        """When approval is submitted after governance window, escalate to timeout."""
+        self._seed_incident("inc-timeout-1")
+        # Simulate elapsed time beyond 30.0s window
+        self.adapter.active_incidents["inc-timeout-1"]["timestamp"] = time.time() - 35.0
+
+        event = {
+            "type": "message",
+            "room_id": self.room_id,
+            "payload": {
+                "sender_name": "operator-alice",
+                "addressed": True,
+                "body": "@planner-agent approve inc-timeout-1 PLAN-B",
+            },
+        }
+        reply = await self.adapter.handle_message_event(event)
+        self.assertIsNotNone(reply)
+        self.assertIn("TIMEOUT_ESCALATED", reply)
+        self.assertIn("Workload mutations are strictly blocked", reply)
+        self.assertIn("inc-timeout-1", self.adapter.finalized_incidents)
+        self.assertNotIn("inc-timeout-1", self.adapter.active_incidents)
+
+    async def test_duplicate_approval_rejected(self) -> None:
+        """Subsequent approval attempt for finalized incident is rejected."""
+        self._seed_incident("inc-dup-1")
+
+        event = {
+            "type": "message",
+            "room_id": self.room_id,
+            "payload": {
+                "sender_name": "operator-alice",
+                "addressed": True,
+                "body": "@planner-agent approve inc-dup-1 PLAN-B",
+            },
+        }
+        # First approval
+        reply1 = await self.adapter.handle_message_event(event)
+        self.assertIn("Approved", reply1)
+
+        # Second approval attempt (duplicate replay)
+        reply2 = await self.adapter.handle_message_event(event)
+        self.assertIn("Duplicate Governance Submission", reply2)
+        self.assertIn("Execution Denied", reply2)
+
+    async def test_duplicate_rejection_rejected(self) -> None:
+        """Subsequent rejection attempt for finalized incident is rejected."""
+        self._seed_incident("inc-dup-2")
+
+        event = {
+            "type": "message",
+            "room_id": self.room_id,
+            "payload": {
+                "sender_name": "operator-alice",
+                "addressed": True,
+                "body": "@planner-agent reject inc-dup-2",
+            },
+        }
+        reply1 = await self.adapter.handle_message_event(event)
+        self.assertIn("Rejected by Operator", reply1)
+
+        # Second rejection attempt
+        reply2 = await self.adapter.handle_message_event(event)
+        self.assertIn("Duplicate Governance Submission", reply2)
+        self.assertIn("Execution Denied", reply2)
+
 

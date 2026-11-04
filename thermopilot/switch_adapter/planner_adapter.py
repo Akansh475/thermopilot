@@ -14,11 +14,17 @@ import asyncio
 import logging
 import re
 import time
+from datetime import datetime, timezone
 from typing import Any
 
 from thermopilot.hitl.switch import SwitchApprovalDesk
 from thermopilot.planner.planner import RecoveryPlanner
-from thermopilot.schemas import GPUTelemetry, WorkloadSpec
+from thermopilot.schemas import (
+    ApprovalAction,
+    ApprovalDecision,
+    GPUTelemetry,
+    WorkloadSpec,
+)
 from thermopilot.switch_adapter.base import BaseSwitchAdapter
 from thermopilot.switch_adapter.client import (
     SwitchHttpClient,
@@ -62,6 +68,7 @@ class PlannerSwitchAdapter(BaseSwitchAdapter):
         )
         self.processed_incidents: set[str] = set()
         self.active_incidents: dict[str, dict[str, Any]] = {}
+        self.finalized_incidents: set[str] = set()
 
     def format_planner_status_reply(self) -> str:
         """Format an informational status card of the recovery planner and SafetyGate."""
@@ -174,20 +181,95 @@ class PlannerSwitchAdapter(BaseSwitchAdapter):
         incident_context: dict[str, Any],
     ) -> str:
         """Handle validated operator approval or rejection command."""
+        # 1. Timeout escalation check
+        timeout_s = self.config.approval_timeout_s
+        elapsed = time.time() - incident_context.get("timestamp", time.time())
+        if elapsed > timeout_s:
+            # Automatic timeout escalation
+            self.finalized_incidents.add(incident_id)
+            self.active_incidents.pop(incident_id, None)
+
+            action = ApprovalAction(
+                incident_id=incident_id,
+                selected_plan_id=None,
+                operator_id=operator_id,
+                decision=ApprovalDecision.TIMEOUT_ESCALATED,
+                timestamp=datetime.now(timezone.utc),
+                notes=f"Operator submission received after {elapsed:.1f}s (window: {timeout_s:.1f}s).",
+            )
+            self.desk.evaluate_approval(
+                approval=action,
+                incident_id=incident_id,
+                current_telemetry=incident_context["telemetry"],
+            )
+
+            reply = (
+                f"⚠️ **Approval Window Expired (TIMEOUT_ESCALATED):** "
+                f"The governance window of {timeout_s:.1f}s for incident `{incident_id}` has expired "
+                f"({elapsed:.1f}s elapsed). Workload mutations are strictly blocked under fail-safe policy."
+                + ADVISORY_FOOTER
+            )
+            await self.http_client.send_message(room_id=room_id, content=reply)
+            return reply
+
+        # 2. Rejection handling
         if cmd == "reject":
+            self.finalized_incidents.add(incident_id)
+            self.active_incidents.pop(incident_id, None)
+
+            action = ApprovalAction(
+                incident_id=incident_id,
+                selected_plan_id=None,
+                operator_id=operator_id,
+                decision=ApprovalDecision.REJECT,
+                timestamp=datetime.now(timezone.utc),
+                notes=f"Explicit rejection by human operator {operator_id}.",
+            )
+            self.desk.evaluate_approval(
+                approval=action,
+                incident_id=incident_id,
+                current_telemetry=incident_context["telemetry"],
+            )
+
             reply = (
                 f"🛑 **Incident `{incident_id}` Rejected by Operator `{operator_id}`.** "
                 "All recovery plans cancelled. Workloads remain in their current state."
                 + ADVISORY_FOOTER
             )
-            self.active_incidents.pop(incident_id, None)
             await self.http_client.send_message(room_id=room_id, content=reply)
             return reply
 
-        # Approve command
+        # 3. Approval handling
+        action = ApprovalAction(
+            incident_id=incident_id,
+            selected_plan_id=plan_id,
+            operator_id=operator_id,
+            decision=ApprovalDecision.APPROVE,
+            timestamp=datetime.now(timezone.utc),
+        )
+        wf_result = self.desk.evaluate_approval(
+            approval=action,
+            incident_id=incident_id,
+            current_telemetry=incident_context["telemetry"],
+        )
+
+        if not wf_result.is_authorized_for_execution:
+            self.finalized_incidents.add(incident_id)
+            self.active_incidents.pop(incident_id, None)
+            reply = (
+                f"⚠️ **Execution Denied by SafetyGate:** Plan `{plan_id}` cannot be executed. "
+                f"Reasons: {'; '.join(wf_result.rejection_reasons)}."
+                + ADVISORY_FOOTER
+            )
+            await self.http_client.send_message(room_id=room_id, content=reply)
+            return reply
+
+        self.finalized_incidents.add(incident_id)
+        self.active_incidents.pop(incident_id, None)
+
         reply = (
-            f"✅ **Plan `{plan_id}` Approved by Operator `{operator_id}` for Incident `{incident_id}`.** "
-            "Dispatching pre-execution SafetyGate verification."
+            f"✅ **Plan `{plan_id}` Approved and Pre-Execution Certified by SafetyGate.** "
+            f"Operator: `{operator_id}` | Incident: `{incident_id}`."
             + ADVISORY_FOOTER
         )
         await self.http_client.send_message(room_id=room_id, content=reply)
@@ -466,6 +548,15 @@ class PlannerSwitchAdapter(BaseSwitchAdapter):
                         + (" <plan_id>`" if cmd == "approve" else "`")
                         + ADVISORY_FOOTER
                     )
+                await self.http_client.send_message(room_id=room_id, content=reply)
+                return reply
+
+            if inc_id in self.finalized_incidents:
+                reply = (
+                    f"⚠️ **Execution Denied: Duplicate Governance Submission.** "
+                    f"Incident '{inc_id}' has already been processed and finalized."
+                    + ADVISORY_FOOTER
+                )
                 await self.http_client.send_message(room_id=room_id, content=reply)
                 return reply
 
