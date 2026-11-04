@@ -679,6 +679,222 @@ class TestSwitchAuditLedger(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(ev.is_simulated)
 
 
+class TestSwitchDemonstrationScenarios(unittest.IsolatedAsyncioTestCase):
+    """End-to-end verification of the four primary ThermoPilot demonstration scenarios.
+
+    Scenario A: Successful Recovery Lifecycle
+        Simulated incident -> multi-agent negotiation -> Plan B certified -> operator approve
+        -> simulation execute -> verification passed (RECOVERED).
+
+    Scenario B: Unsafe Plan Blocked by SafetyGate
+        Operator attempts to approve unsafe candidate (Plan D) -> SafetyGate blocks
+        -> execution blocked -> incident marked REVALIDATION_FAILED.
+
+    Scenario C: Human Rejection
+        Plan B certified -> operator issues explicit rejection -> execution blocked
+        -> incident marked REJECTED.
+
+    Scenario D: Approval Timeout Escalation
+        Plan B certified -> operator fails to respond within governance timeout
+        -> submission rejected -> incident marked TIMEOUT_ESCALATED.
+    """
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.ledger_path = Path(self.temp_dir.name) / "scenario_ledger.jsonl"
+        self.ledger = AuditLedger(ledger_path=self.ledger_path)
+        self.room_id = "test-demo-room"
+        self.config = SwitchAdapterConfig(
+            agent_id="test-planner-id",
+            api_key="test-planner-key",
+            client_name="planner-agent",
+            allowed_rooms=frozenset({self.room_id}),
+            authorized_operators=frozenset({"operator-alice", "lead-engineer"}),
+            approval_timeout_s=10.0,
+        )
+        self.mock_http = AsyncMock(spec=SwitchHttpClient)
+        self.adapter = PlannerSwitchAdapter(
+            self.config,
+            ledger=self.ledger,
+            http_client=self.mock_http,
+        )
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def _create_standard_bids(self, incident_id: str) -> WorkloadBidPayload:
+        return WorkloadBidPayload(
+            incident_id=incident_id,
+            proposals=[
+                WorkloadBidItem(
+                    workload_id="wl-alpha-inference",
+                    name="Financial Trading Inference",
+                    priority="P0_CRITICAL",
+                    current_power_w=250.0,
+                    min_power_w=200.0,
+                    requested_power_w=220.0,
+                    can_preempt=False,
+                    sla_importance_score=0.99,
+                    rationale="Ultra-low latency inference",
+                    estimated_trade_off="Power cap to 220W acceptable",
+                ),
+                WorkloadBidItem(
+                    workload_id="wl-beta-training",
+                    name="Diffusion Model Pre-Training",
+                    priority="P2_FLEXIBLE",
+                    current_power_w=150.0,
+                    min_power_w=150.0,
+                    requested_power_w=160.0,
+                    can_preempt=True,
+                    sla_importance_score=0.15,
+                    rationale="Batch offline workload",
+                    estimated_trade_off="Can throttle or pause",
+                ),
+            ],
+        )
+
+    async def test_scenario_a_successful_recovery(self) -> None:
+        """Scenario A: Simulated incident -> Plan B certified -> Operator approve -> Executed -> Recovered."""
+        incident_id = "inc-demo-scenario-a"
+        bids = self._create_standard_bids(incident_id)
+
+        # 1. Perception, formulation, and decision card dispatch
+        _, safety_res, _, card = self.adapter.plan_and_certify(bids, room_id=self.room_id)
+        self.assertTrue(any(ev.passed for ev in safety_res.evaluations))
+        self.assertIn("PLAN-B", card.executable_plan_ids)
+        self.assertIn("PLAN-D", card.rejected_plan_ids)
+
+        sm = self.adapter.state_machines[incident_id]
+        self.assertEqual(sm.current_state, IncidentState.AWAITING_APPROVAL)
+
+        # 2. Operator submits approval for certified Plan B
+        event = {
+            "type": "message",
+            "room_id": self.room_id,
+            "payload": {
+                "sender_name": "operator-alice",
+                "addressed": True,
+                "body": f"@planner-agent approve {incident_id} PLAN-B",
+            },
+        }
+        res = await self.adapter.handle_message_event(event)
+        self.assertIsInstance(res, list)
+        self.assertEqual(len(res), 3)
+
+        # 3. Verify Execution Result
+        exec_msg = parse_switch_message(res[1])
+        self.assertIsInstance(exec_msg, ExecutionResultPayload)
+        self.assertTrue(exec_msg.success)
+        self.assertTrue(exec_msg.revalidation_passed)
+        self.assertTrue(exec_msg.is_simulated)
+
+        # 4. Verify Post-Execution Verification Report
+        verif_msg = parse_switch_message(res[2])
+        self.assertIsInstance(verif_msg, VerificationReportPayload)
+        self.assertTrue(verif_msg.recovery_successful)
+        self.assertTrue(verif_msg.reached_target)
+        self.assertGreater(verif_msg.cooling_rate_c_per_s, 0.0)
+        self.assertEqual(verif_msg.audit_hash, self.ledger.last_hash)
+
+        # 5. Verify State Machine is in RECOVERED state
+        self.assertEqual(sm.current_state, IncidentState.RECOVERED)
+        self.assertTrue(sm.is_terminal)
+
+        # 6. Verify Audit Ledger integrity
+        report = self.ledger.verify_chain()
+        self.assertTrue(report.is_valid)
+        self.assertGreaterEqual(report.total_events, 8)
+
+    async def test_scenario_b_unsafe_plan_blocked_by_safetygate(self) -> None:
+        """Scenario B: Unsafe Plan D -> SafetyGate blocks -> Pre-execution revalidation fails -> REVALIDATION_FAILED."""
+        incident_id = "inc-demo-scenario-b"
+        bids = self._create_standard_bids(incident_id)
+
+        self.adapter.plan_and_certify(bids, room_id=self.room_id)
+        sm = self.adapter.state_machines[incident_id]
+
+        # Operator attempts to approve uncertified/unsafe Plan D
+        event = {
+            "type": "message",
+            "room_id": self.room_id,
+            "payload": {
+                "sender_name": "operator-alice",
+                "addressed": True,
+                "body": f"@planner-agent approve {incident_id} PLAN-D",
+            },
+        }
+        reply = await self.adapter.handle_message_event(event)
+        self.assertIsInstance(reply, str)
+        self.assertIn("Execution Denied by SafetyGate", reply)
+        self.assertIn("PLAN-D", reply)
+
+        # Confirm state transitioned to terminal REVALIDATION_FAILED
+        self.assertEqual(sm.current_state, IncidentState.REVALIDATION_FAILED)
+        self.assertTrue(sm.is_terminal)
+
+        # Verify incident cannot be executed afterwards
+        self.assertIn(incident_id, self.adapter.finalized_incidents)
+
+    async def test_scenario_c_explicit_human_rejection(self) -> None:
+        """Scenario C: Plan B certified -> Operator rejects -> No execution -> REJECTED."""
+        incident_id = "inc-demo-scenario-c"
+        bids = self._create_standard_bids(incident_id)
+
+        self.adapter.plan_and_certify(bids, room_id=self.room_id)
+        sm = self.adapter.state_machines[incident_id]
+
+        # Operator rejects
+        event = {
+            "type": "message",
+            "room_id": self.room_id,
+            "payload": {
+                "sender_name": "lead-engineer",
+                "addressed": True,
+                "body": f"@planner-agent reject {incident_id}",
+            },
+        }
+        reply = await self.adapter.handle_message_event(event)
+        self.assertIsInstance(reply, str)
+        self.assertIn("Rejected by Operator", reply)
+
+        # Confirm state transitioned to terminal REJECTED
+        self.assertEqual(sm.current_state, IncidentState.REJECTED)
+        self.assertTrue(sm.is_terminal)
+        self.assertIn(incident_id, self.adapter.finalized_incidents)
+
+    async def test_scenario_d_approval_timeout_escalation(self) -> None:
+        """Scenario D: Governance window expires -> Approval rejected -> TIMEOUT_ESCALATED."""
+        incident_id = "inc-demo-scenario-d"
+        bids = self._create_standard_bids(incident_id)
+
+        self.adapter.plan_and_certify(bids, room_id=self.room_id)
+        sm = self.adapter.state_machines[incident_id]
+
+        # Artificially age the incident timestamp beyond 10s timeout
+        self.adapter.active_incidents[incident_id]["timestamp"] = time.time() - 25.0
+
+        # Operator tries to approve after timeout
+        event = {
+            "type": "message",
+            "room_id": self.room_id,
+            "payload": {
+                "sender_name": "operator-alice",
+                "addressed": True,
+                "body": f"@planner-agent approve {incident_id} PLAN-B",
+            },
+        }
+        reply = await self.adapter.handle_message_event(event)
+        self.assertIsInstance(reply, str)
+        self.assertIn("TIMEOUT_ESCALATED", reply)
+        self.assertIn("Approval Window Expired", reply)
+
+        # Confirm state transitioned to terminal TIMEOUT_ESCALATED
+        self.assertEqual(sm.current_state, IncidentState.TIMEOUT_ESCALATED)
+        self.assertTrue(sm.is_terminal)
+        self.assertIn(incident_id, self.adapter.finalized_incidents)
+
+
+
 
 
 

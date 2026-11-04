@@ -6,6 +6,7 @@
 
 # Runtime audit logs
 .audit/
+data/
 
 # Python bytecode and caches
 __pycache__/
