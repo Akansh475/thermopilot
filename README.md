@@ -1,7 +1,7 @@
 # ThermoPilot Compute Desk
 
 > **Turning GPU thermal incidents into cost-aware, human-approved business decisions.**
-> Built for the **Flip the Switch Hackathon 2026** — **100% Complete & Verified (207 Tests Passing)**.
+> Built for the **Flip the Switch Hackathon 2026** — **100% Complete & Verified (277 Tests Passing)**.
 
 ---
 
@@ -79,6 +79,7 @@ pip install pydantic
 
 | Mode | Command Line | Description |
 | :--- | :--- | :--- |
+| **Switch Multi-Agent Runner** | `python -m thermopilot.switch_adapter` | Launches all 3 Switch agents (`forecast`, `workload`, `planner`) with live WebSocket connections to Discord. |
 | **Automated 60s Demo** | `python -m thermopilot.cli --auto` | Runs complete 8-stage hackathon presentation in terminal. |
 | **Interactive Control Desk** | `python -m thermopilot.cli --interactive` | Interactive REPL with operator hotkeys (`[1]`, `[2]`, `[3]`, `[R]`, `[T]`). |
 | **Web Control Room Dashboard** | `python -m thermopilot.cli --web --port 8080` | Launches local browser GUI at `http://localhost:8080`. |
@@ -87,10 +88,63 @@ pip install pydantic
 | **Operator Timeout Escalation** | `python -m thermopilot.cli --timeout` | Proves approval timeout escalates without modifying workloads. |
 | **Reset Simulator State** | `python -m thermopilot.cli --reset` | Cleans audit log and restores 81.5°C initial conditions. |
 
+### Switch Multi-Agent & Discord Live Demo Setup
+
+1. **Keep Switch Console Open:** The **Switch Console** desktop application must remain open and running (`http://127.0.0.1:60824`) to maintain the local bridge and WebSocket routing.
+2. **Room Assignment:** Ensure all three agents (`forecast-agent`, `workload-agent`, `planner-agent`) are registered and connected to the target Discord room (e.g. `Akansh Server: general`).
+3. **Start the Multi-Agent Switch Runner:**
+   ```bash
+   python -m thermopilot.switch_adapter
+   ```
+   Maintains independent WebSocket connections, credential isolation, heartbeat tracking, and message dispatch for all three agents.
+4. **Simulation Boundary Reminder:** All GPU telemetry, runaway trajectories, and workload power-cap actuations are discrete-time mathematical simulations with zero physical hardware access.
+
+### Demonstrating the Four Core Scenarios
+
+#### Scenario A: Successful Recovery Lifecycle
+1. Trigger the simulated anomaly in Discord:
+   ```text
+   @forecast-agent simulate-anomaly
+   ```
+2. The multi-agent workflow initiates automatically:
+   - `forecast-agent` posts a thermal runaway perception alert (`81.5°C`, Time-to-Trip `23.3s`, marked `[SIMULATED TELEMETRY]`).
+   - `workload-agent` calculates urgency and submits competing tenant bids (VIP P0 non-preemption vs. elastic P2 training).
+   - `planner-agent` evaluates candidates via SafetyGate, certifies Plan B, blocks Plan D, and publishes a Decision Card.
+3. Authorize the certified plan within the **30-second governance window** using the **actual incident ID** from the decision card:
+   ```text
+   @planner-agent approve <incident_id> PLAN-B
+   ```
+4. Outcome: SafetyGate revalidates immediately pre-execution, `SimulationExecutor` modulates simulated workloads, and `VerificationAgent` confirms cooling to $\le 75.0^\circ\text{C}$ safe envelope with zero SLA violations and publishes the report with an append-only SHA-256 cryptographic `audit_hash`.
+
+#### Scenario B: Unsafe Plan Blocked by SafetyGate
+1. After an anomaly alert, attempt to approve the uncertified/unsafe Plan D:
+   ```text
+   @planner-agent approve <incident_id> PLAN-D
+   ```
+2. Outcome: SafetyGate strictly blocks execution (`Execution Denied by SafetyGate`). Zero workloads are mutated, and the incident transitions to `REVALIDATION_FAILED`.  
+   *(CLI direct proof: `python -m thermopilot.cli --attempt-plan-d`)*
+
+#### Scenario C: Explicit Human Operator Rejection
+1. Reject the recovery proposals:
+   ```text
+   @planner-agent reject <incident_id>
+   ```
+2. Outcome: Recovery plans are cancelled. Workloads remain in their current state, and the incident transitions to `REJECTED`.  
+   *(CLI direct proof: `python -m thermopilot.cli --reject`)*
+
+#### Scenario D: Approval Timeout Escalation
+1. Trigger an anomaly with `@forecast-agent simulate-anomaly` and allow the **30-second governance window** to elapse without submitting an approval.
+2. If an approval is submitted after expiration:
+   ```text
+   @planner-agent approve <incident_id> PLAN-B
+   ```
+3. Outcome: Fail-safe policy triggers automatic timeout escalation (`TIMEOUT_ESCALATED`). Workload mutations are strictly blocked to prevent uncoordinated execution.  
+   *(CLI direct proof: `python -m thermopilot.cli --timeout`)*
+
 ### Running Quality Checks & Tests
 
 ```bash
-# Run complete test suite (207 tests)
+# Run complete test suite (277 tests)
 pytest
 
 # Run Ruff linter
@@ -154,10 +208,11 @@ Thermo_plot/
 │   ├── planner/                   # Recovery planner (Llama prompt pipeline + deterministic fallback)
 │   ├── safety/                    # Deterministic SafetyGate rule evaluator
 │   ├── hitl/                      # Switch HITL approval desk & decision card dispatch
+│   ├── switch_adapter/            # Multi-agent Switch runtime & WebSocket protocol adapters
 │   ├── executor/                  # Simulation plan executor & post-execution verification agent
 │   ├── audit/                     # Cryptographic append-only JSONL audit ledger & state machine
 │   └── ui/                        # Compute Desk ANSI terminal interface & local web control room
-└── tests/                         # Complete pytest test suite (207 tests, 100% passing)
+└── tests/                         # Complete pytest test suite (277 tests, 100% passing)
 ```
 
 ---
