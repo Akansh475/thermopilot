@@ -17,6 +17,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
+from thermopilot.audit.ledger import AuditLedger
 from thermopilot.audit.state_machine import IncidentStateMachine
 from thermopilot.executor.executor import SimulationExecutor
 from thermopilot.executor.verifier import VerificationAgent
@@ -25,6 +26,7 @@ from thermopilot.planner.planner import RecoveryPlanner
 from thermopilot.schemas import (
     ApprovalAction,
     ApprovalDecision,
+    AuditEventType,
     GPUTelemetry,
     IncidentState,
     WorkloadSpec,
@@ -67,6 +69,7 @@ class PlannerSwitchAdapter(BaseSwitchAdapter):
         executor: SimulationExecutor | None = None,
         verifier: VerificationAgent | None = None,
         simulator: TelemetrySimulator | None = None,
+        ledger: AuditLedger | None = None,
         http_client: SwitchHttpClient | None = None,
         ws_client: SwitchWebSocketClient | None = None,
     ) -> None:
@@ -79,6 +82,7 @@ class PlannerSwitchAdapter(BaseSwitchAdapter):
         self.executor = executor or SimulationExecutor()
         self.verifier = verifier or VerificationAgent(target_cooling_rate_c_per_s=0.20)
         self.simulator = simulator or TelemetrySimulator()
+        self.ledger = ledger if ledger is not None else AuditLedger(ledger_path="data/audit_ledger.jsonl")
         self.processed_incidents: set[str] = set()
         self.active_incidents: dict[str, dict[str, Any]] = {}
         self.finalized_incidents: set[str] = set()
@@ -281,6 +285,17 @@ class PlannerSwitchAdapter(BaseSwitchAdapter):
             current_telemetry=incident_context["telemetry"],
         )
 
+        self.ledger.append(
+            incident_id=incident_id,
+            event_type=AuditEventType.PRE_EXECUTION_REVALIDATED,
+            payload={
+                "plan_id": plan_id,
+                "passed": wf_result.is_authorized_for_execution,
+                "rejection_reasons": list(wf_result.rejection_reasons),
+            },
+            is_simulated=True,
+        )
+
         sm = self.state_machines.get(incident_id)
         if not wf_result.is_authorized_for_execution:
             self.finalized_incidents.add(incident_id)
@@ -335,6 +350,18 @@ class PlannerSwitchAdapter(BaseSwitchAdapter):
             workloads=incident_context["workloads"],
         )
 
+        self.ledger.append(
+            incident_id=incident_id,
+            event_type=AuditEventType.PLAN_EXECUTED,
+            payload={
+                "execution_id": exec_res.execution_id,
+                "plan_id": plan_id or "PLAN-B",
+                "applied_actions": [a.model_dump(mode="json") for a in exec_res.applied_actions],
+                "total_node_power_w": exec_res.details.get("total_node_power_w"),
+            },
+            is_simulated=True,
+        )
+
         if sm and sm.can_transition_to(IncidentState.VERIFYING):
             sm.transition(to_state=IncidentState.VERIFYING, plan_id=plan_id)
 
@@ -364,6 +391,20 @@ class PlannerSwitchAdapter(BaseSwitchAdapter):
             incident_id=incident_id,
         )
 
+        self.ledger.append(
+            incident_id=incident_id,
+            event_type=AuditEventType.VERIFICATION_COMPLETED,
+            payload={
+                "verification_id": verif_rep.verification_id,
+                "recovery_successful": verif_rep.recovery_successful,
+                "initial_temp_c": verif_rep.initial_temp_c,
+                "final_temp_c": verif_rep.final_temp_c,
+                "cooling_rate_c_per_s": verif_rep.observed_cooling_rate_c_per_s,
+                "reached_target": verif_rep.reached_target,
+            },
+            is_simulated=True,
+        )
+
         if sm:
             final_state = (
                 IncidentState.RECOVERED
@@ -383,7 +424,7 @@ class PlannerSwitchAdapter(BaseSwitchAdapter):
             cooling_rate_c_per_s=verif_rep.observed_cooling_rate_c_per_s,
             reached_target=verif_rep.reached_target,
             ticks_to_target=verif_rep.ticks_to_target,
-            audit_hash=None,
+            audit_hash=self.ledger.last_hash,
             is_simulated=True,
         )
 
@@ -442,11 +483,46 @@ class PlannerSwitchAdapter(BaseSwitchAdapter):
             self.simulator.set_workload_power(w.workload_id, w.current_power_w)
         self.simulator._core_temp_c = telemetry.temperature_core_c
 
+        # Record incident detection in audit ledger
+        self.ledger.append(
+            incident_id=incident_id,
+            event_type=AuditEventType.INCIDENT_TRIGGERED,
+            payload={
+                "core_temp_c": telemetry.temperature_core_c,
+                "power_draw_w": telemetry.power_draw_w,
+                "ambient_temp_c": telemetry.ambient_temp_c,
+                "gpu_id": telemetry.gpu_id,
+            },
+            is_simulated=True,
+        )
+
         planner_result = self.planner.plan(
             telemetry=telemetry,
             workloads=workloads,
             include_unsafe_candidate=True,
         )
+
+        self.ledger.append(
+            incident_id=incident_id,
+            event_type=AuditEventType.PLANNER_PLANS_GENERATED,
+            payload={
+                "plan_ids": [c.plan.plan_id for c in planner_result.candidates],
+                "safe_plan_ids": [c.plan.plan_id for c in planner_result.safe_candidates],
+            },
+            is_simulated=True,
+        )
+
+        for c in planner_result.candidates:
+            self.ledger.append(
+                incident_id=incident_id,
+                event_type=AuditEventType.SAFETY_GATE_EVALUATED,
+                payload={
+                    "plan_id": c.plan.plan_id,
+                    "passed": c.safety_result.passed,
+                    "rejection_reasons": list(c.safety_result.rejection_reasons),
+                },
+                is_simulated=True,
+            )
 
         # 1. Recovery Proposal Payload
         candidate_items: list[RecoveryCandidateItem] = []
@@ -539,6 +615,18 @@ class PlannerSwitchAdapter(BaseSwitchAdapter):
             timeout_s=self.config.approval_timeout_s,
         )
 
+        self.ledger.append(
+            incident_id=incident_id,
+            event_type=AuditEventType.DECISION_CARD_DISPATCHED,
+            payload={
+                "incident_id": incident_id,
+                "executable_plans": list(card.executable_plan_ids),
+                "rejected_plans": list(card.rejected_plan_ids),
+                "severity": card.severity,
+            },
+            is_simulated=True,
+        )
+
         card_items: list[DecisionCardItem] = []
         for p in card.candidate_plans:
             card_items.append(
@@ -592,6 +680,7 @@ class PlannerSwitchAdapter(BaseSwitchAdapter):
         self.state_machines[incident_id] = IncidentStateMachine(
             incident_id=incident_id,
             initial_state=IncidentState.AWAITING_APPROVAL,
+            ledger=self.ledger,
         )
 
         return rec_proposal, safety_result, negotiation_complete, decision_card

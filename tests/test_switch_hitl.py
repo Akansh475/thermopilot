@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import tempfile
 import time
 import unittest
+from pathlib import Path
 from unittest.mock import AsyncMock
 
+from thermopilot.audit.ledger import AuditLedger
 from thermopilot.schemas import IncidentState, NodeConstraints
 from thermopilot.switch_adapter.client import SwitchHttpClient
 from thermopilot.switch_adapter.config import SwitchAdapterConfig
@@ -581,6 +584,100 @@ class TestSwitchSimulationExecutor(unittest.IsolatedAsyncioTestCase):
         # State machine transition to RECOVERED
         sm = self.adapter.state_machines["inc-exec-test"]
         self.assertEqual(sm.current_state, IncidentState.RECOVERED)
+
+
+class TestSwitchAuditLedger(unittest.IsolatedAsyncioTestCase):
+    """Test suite verifying cryptographic hash chain audit logging across HITL workflow."""
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.ledger_path = Path(self.temp_dir.name) / "test_audit.jsonl"
+        self.ledger = AuditLedger(ledger_path=self.ledger_path)
+        self.room_id = "test-room-ledger"
+        self.config = SwitchAdapterConfig(
+            agent_id="test-planner-id",
+            api_key="test-planner-key",
+            client_name="planner-agent",
+            allowed_rooms=frozenset({self.room_id}),
+            authorized_operators=frozenset({"operator-alice"}),
+            approval_timeout_s=30.0,
+        )
+        self.mock_http = AsyncMock(spec=SwitchHttpClient)
+        self.adapter = PlannerSwitchAdapter(
+            self.config,
+            ledger=self.ledger,
+            http_client=self.mock_http,
+        )
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    async def test_full_lifecycle_audit_hash_chain_integrity(self) -> None:
+        """Every HITL phase writes to append-only ledger and validates cryptographic chain."""
+        incident_id = "inc-ledger-chain-1"
+        bids = WorkloadBidPayload(
+            incident_id=incident_id,
+            proposals=[
+                WorkloadBidItem(
+                    workload_id="wl-alpha-inference",
+                    name="Financial Trading Batch",
+                    priority="P0_CRITICAL",
+                    current_power_w=250.0,
+                    min_power_w=200.0,
+                    requested_power_w=220.0,
+                    can_preempt=False,
+                    sla_importance_score=0.98,
+                    rationale="VIP non-preemptible",
+                    estimated_trade_off="None",
+                ),
+                WorkloadBidItem(
+                    workload_id="wl-beta-training",
+                    name="Diffusion Fine-Tuning",
+                    priority="P2_FLEXIBLE",
+                    current_power_w=150.0,
+                    min_power_w=150.0,
+                    requested_power_w=160.0,
+                    can_preempt=True,
+                    sla_importance_score=0.15,
+                    rationale="Elastic batch training",
+                    estimated_trade_off="Can cap or pause",
+                ),
+            ],
+        )
+
+        # 1. Perception, Candidate Formulation & Card Dispatch
+        self.adapter.plan_and_certify(bids, room_id=self.room_id)
+
+        # 2. Operator Approval & Actuation
+        event = {
+            "type": "message",
+            "room_id": self.room_id,
+            "payload": {
+                "sender_name": "operator-alice",
+                "addressed": True,
+                "body": f"@planner-agent approve {incident_id} PLAN-B",
+            },
+        }
+        res = await self.adapter.handle_message_event(event)
+        self.assertIsInstance(res, list)
+        self.assertEqual(len(res), 3)
+
+        # 3. Check Verification Report includes valid cryptographic hash
+        msg_verif = parse_switch_message(res[2])
+        self.assertIsInstance(msg_verif, VerificationReportPayload)
+        self.assertIsNotNone(msg_verif.audit_hash)
+        self.assertEqual(msg_verif.audit_hash, self.ledger.last_hash)
+
+        # 4. Validate Cryptographic Hash Chain
+        chain_report = self.ledger.verify_chain()
+        self.assertTrue(chain_report.is_valid, f"Chain corrupted: {chain_report.errors}")
+        self.assertGreaterEqual(chain_report.total_events, 8)
+
+        # 5. Verify all events have simulated flag set to True
+        events = self.ledger.read_events(incident_id=incident_id)
+        for ev in events:
+            self.assertTrue(ev.is_simulated)
+
 
 
 

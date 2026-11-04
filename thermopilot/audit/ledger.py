@@ -176,6 +176,12 @@ class AuditLedger:
         with self._lock:
             return self._last_sequence_num + 1
 
+    @property
+    def last_hash(self) -> str | None:
+        """The SHA-256 hash of the most recent audit event in the chain."""
+        with self._lock:
+            return self._last_hash
+
     def __len__(self) -> int:
         return self.event_count
 
