@@ -6,6 +6,7 @@ import time
 import unittest
 from unittest.mock import AsyncMock
 
+from thermopilot.schemas import NodeConstraints
 from thermopilot.switch_adapter.client import SwitchHttpClient
 from thermopilot.switch_adapter.config import SwitchAdapterConfig
 from thermopilot.switch_adapter.messages import (
@@ -383,5 +384,103 @@ class TestSwitchTimeoutAndDuplicate(unittest.IsolatedAsyncioTestCase):
         reply2 = await self.adapter.handle_message_event(event)
         self.assertIn("Duplicate Governance Submission", reply2)
         self.assertIn("Execution Denied", reply2)
+
+
+class TestSwitchPreExecutionSafetyGate(unittest.IsolatedAsyncioTestCase):
+    """Test suite verifying SafetyGate pre-execution revalidation and unsafe plan blocking."""
+
+    def setUp(self) -> None:
+        self.room_id = "test-room-safety"
+        self.config = SwitchAdapterConfig(
+            agent_id="test-planner-id",
+            api_key="test-planner-key",
+            client_name="planner-agent",
+            allowed_rooms=frozenset({self.room_id}),
+            authorized_operators=frozenset({"operator-alice"}),
+            approval_timeout_s=30.0,
+        )
+        self.mock_http = AsyncMock(spec=SwitchHttpClient)
+        self.adapter = PlannerSwitchAdapter(self.config, http_client=self.mock_http)
+
+        # Seed an incident with candidate plans including unsafe Plan D
+        bids = WorkloadBidPayload(
+            incident_id="inc-safety-gate",
+            proposals=[
+                WorkloadBidItem(
+                    workload_id="wl-alpha-inference",
+                    name="Financial Trading Batch",
+                    priority="P0_CRITICAL",
+                    current_power_w=250.0,
+                    min_power_w=200.0,
+                    requested_power_w=220.0,
+                    can_preempt=False,
+                    sla_importance_score=0.98,
+                    rationale="VIP non-preemptible",
+                    estimated_trade_off="None",
+                ),
+                WorkloadBidItem(
+                    workload_id="wl-beta-training",
+                    name="Diffusion Fine-Tuning",
+                    priority="P2_FLEXIBLE",
+                    current_power_w=150.0,
+                    min_power_w=150.0,
+                    requested_power_w=160.0,
+                    can_preempt=True,
+                    sla_importance_score=0.15,
+                    rationale="Elastic batch training",
+                    estimated_trade_off="Can cap or pause",
+                ),
+            ],
+        )
+        self.rec, self.saf, self.neg, self.card = self.adapter.plan_and_certify(
+            bids, room_id=self.room_id
+        )
+
+    def test_unsafe_plan_d_marked_rejected_in_decision_card(self) -> None:
+        """Verify Plan D is categorized as rejected and non-executable in the decision card."""
+        self.assertIn("PLAN-D", self.card.rejected_plan_ids)
+        self.assertNotIn("PLAN-D", self.card.executable_plan_ids)
+        self.assertIn("PLAN-B", self.card.executable_plan_ids)
+
+    async def test_attempted_approval_of_unsafe_plan_d_strictly_blocked(self) -> None:
+        """Even if operator attempts to approve Plan D, SafetyGate strictly blocks execution."""
+        event = {
+            "type": "message",
+            "room_id": self.room_id,
+            "payload": {
+                "sender_name": "operator-alice",
+                "addressed": True,
+                "body": "@planner-agent approve inc-safety-gate PLAN-D",
+            },
+        }
+        reply = await self.adapter.handle_message_event(event)
+        self.assertIsNotNone(reply)
+        self.assertIn("Execution Denied by SafetyGate", reply)
+        self.assertIn("Selected plan 'PLAN-D' was rejected by the Safety Gate", reply)
+        self.assertIn("inc-safety-gate", self.adapter.finalized_incidents)
+        self.assertNotIn("inc-safety-gate", self.adapter.active_incidents)
+
+    async def test_pre_execution_revalidation_failure_on_tighter_constraints(self) -> None:
+        """If node constraints tighten prior to approval, revalidation blocks execution."""
+        # Tighten power budget below Plan B's projected power (~350W)
+        self.adapter.desk._incident_constraints["inc-safety-gate"] = NodeConstraints(
+            power_budget_w=200.0,
+            max_temp_c=70.0,
+        )
+
+        event = {
+            "type": "message",
+            "room_id": self.room_id,
+            "payload": {
+                "sender_name": "operator-alice",
+                "addressed": True,
+                "body": "@planner-agent approve inc-safety-gate PLAN-B",
+            },
+        }
+        reply = await self.adapter.handle_message_event(event)
+        self.assertIsNotNone(reply)
+        self.assertIn("Execution Denied by SafetyGate", reply)
+        self.assertIn("Pre-execution Safety Gate revalidation failed", reply)
+
 
 
