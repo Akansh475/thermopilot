@@ -17,13 +17,16 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
+from thermopilot.audit.state_machine import IncidentStateMachine
 from thermopilot.executor.executor import SimulationExecutor
+from thermopilot.executor.verifier import VerificationAgent
 from thermopilot.hitl.switch import SwitchApprovalDesk
 from thermopilot.planner.planner import RecoveryPlanner
 from thermopilot.schemas import (
     ApprovalAction,
     ApprovalDecision,
     GPUTelemetry,
+    IncidentState,
     WorkloadSpec,
 )
 from thermopilot.simulator.telemetry import TelemetrySimulator
@@ -43,6 +46,7 @@ from thermopilot.switch_adapter.messages import (
     RecoveryProposalPayload,
     SafetyEvaluationItem,
     SafetyResultPayload,
+    VerificationReportPayload,
     WorkloadActionItem,
     WorkloadBidPayload,
     format_discord_message,
@@ -61,6 +65,7 @@ class PlannerSwitchAdapter(BaseSwitchAdapter):
         planner: RecoveryPlanner | None = None,
         desk: SwitchApprovalDesk | None = None,
         executor: SimulationExecutor | None = None,
+        verifier: VerificationAgent | None = None,
         simulator: TelemetrySimulator | None = None,
         http_client: SwitchHttpClient | None = None,
         ws_client: SwitchWebSocketClient | None = None,
@@ -72,10 +77,12 @@ class PlannerSwitchAdapter(BaseSwitchAdapter):
             default_timeout_s=self.config.approval_timeout_s,
         )
         self.executor = executor or SimulationExecutor()
+        self.verifier = verifier or VerificationAgent(target_cooling_rate_c_per_s=0.20)
         self.simulator = simulator or TelemetrySimulator()
         self.processed_incidents: set[str] = set()
         self.active_incidents: dict[str, dict[str, Any]] = {}
         self.finalized_incidents: set[str] = set()
+        self.state_machines: dict[str, IncidentStateMachine] = {}
 
     def format_planner_status_reply(self) -> str:
         """Format an informational status card of the recovery planner and SafetyGate."""
@@ -210,6 +217,13 @@ class PlannerSwitchAdapter(BaseSwitchAdapter):
                 current_telemetry=incident_context["telemetry"],
             )
 
+            sm = self.state_machines.get(incident_id)
+            if sm and sm.can_transition_to(IncidentState.TIMEOUT_ESCALATED):
+                sm.transition(
+                    to_state=IncidentState.TIMEOUT_ESCALATED,
+                    reason="Approval timeout expired.",
+                )
+
             reply = (
                 f"⚠️ **Approval Window Expired (TIMEOUT_ESCALATED):** "
                 f"The governance window of {timeout_s:.1f}s for incident `{incident_id}` has expired "
@@ -238,6 +252,13 @@ class PlannerSwitchAdapter(BaseSwitchAdapter):
                 current_telemetry=incident_context["telemetry"],
             )
 
+            sm = self.state_machines.get(incident_id)
+            if sm and sm.can_transition_to(IncidentState.REJECTED):
+                sm.transition(
+                    to_state=IncidentState.REJECTED,
+                    reason=f"Operator {operator_id} rejected.",
+                )
+
             reply = (
                 f"🛑 **Incident `{incident_id}` Rejected by Operator `{operator_id}`.** "
                 "All recovery plans cancelled. Workloads remain in their current state."
@@ -260,9 +281,19 @@ class PlannerSwitchAdapter(BaseSwitchAdapter):
             current_telemetry=incident_context["telemetry"],
         )
 
+        sm = self.state_machines.get(incident_id)
         if not wf_result.is_authorized_for_execution:
             self.finalized_incidents.add(incident_id)
             self.active_incidents.pop(incident_id, None)
+            if sm:
+                if sm.can_transition_to(IncidentState.APPROVED):
+                    sm.transition(to_state=IncidentState.APPROVED, plan_id=plan_id)
+                if sm.can_transition_to(IncidentState.REVALIDATION_FAILED):
+                    sm.transition(
+                        to_state=IncidentState.REVALIDATION_FAILED,
+                        plan_id=plan_id,
+                        reason="Pre-execution Safety Gate revalidation failed.",
+                    )
             reply = (
                 f"⚠️ **Execution Denied by SafetyGate:** Plan `{plan_id}` cannot be executed. "
                 f"Reasons: {'; '.join(wf_result.rejection_reasons)}."
@@ -273,6 +304,22 @@ class PlannerSwitchAdapter(BaseSwitchAdapter):
 
         self.finalized_incidents.add(incident_id)
         self.active_incidents.pop(incident_id, None)
+
+        if sm:
+            if sm.can_transition_to(IncidentState.APPROVED):
+                sm.transition(
+                    to_state=IncidentState.APPROVED,
+                    plan_id=plan_id,
+                    is_authorized=True,
+                    revalidation_passed=True,
+                )
+            if sm.can_transition_to(IncidentState.EXECUTING):
+                sm.transition(
+                    to_state=IncidentState.EXECUTING,
+                    plan_id=plan_id,
+                    is_authorized=True,
+                    revalidation_passed=True,
+                )
 
         msg_auth = (
             f"✅ **Plan `{plan_id}` Approved and Pre-Execution Certified by SafetyGate.** "
@@ -287,6 +334,9 @@ class PlannerSwitchAdapter(BaseSwitchAdapter):
             simulator=self.simulator,
             workloads=incident_context["workloads"],
         )
+
+        if sm and sm.can_transition_to(IncidentState.VERIFYING):
+            sm.transition(to_state=IncidentState.VERIFYING, plan_id=plan_id)
 
         exec_payload = ExecutionResultPayload(
             incident_id=incident_id,
@@ -304,7 +354,44 @@ class PlannerSwitchAdapter(BaseSwitchAdapter):
         msg_exec = format_discord_message(exec_payload)
         await self.http_client.send_message(room_id=room_id, content=msg_exec)
 
-        return [msg_auth, msg_exec]
+        # 5. Post-Execution Verification
+        assert wf_result.selected_plan is not None
+        verif_rep = self.verifier.verify(
+            simulator=self.simulator,
+            plan=wf_result.selected_plan,
+            workloads=incident_context["workloads"],
+            execution_result=exec_res,
+            incident_id=incident_id,
+        )
+
+        if sm:
+            final_state = (
+                IncidentState.RECOVERED
+                if verif_rep.recovery_successful
+                else IncidentState.RECOVERY_FAILED
+            )
+            if sm.can_transition_to(final_state):
+                sm.transition(to_state=final_state, plan_id=plan_id)
+
+        verif_payload = VerificationReportPayload(
+            incident_id=incident_id,
+            verification_id=verif_rep.verification_id,
+            plan_id=plan_id or "PLAN-B",
+            recovery_successful=verif_rep.recovery_successful,
+            initial_temp_c=verif_rep.initial_temp_c,
+            final_temp_c=verif_rep.final_temp_c,
+            cooling_rate_c_per_s=verif_rep.observed_cooling_rate_c_per_s,
+            reached_target=verif_rep.reached_target,
+            ticks_to_target=verif_rep.ticks_to_target,
+            audit_hash=None,
+            is_simulated=True,
+        )
+
+        await asyncio.sleep(0.3)
+        msg_verif = format_discord_message(verif_payload)
+        await self.http_client.send_message(room_id=room_id, content=msg_verif)
+
+        return [msg_auth, msg_exec, msg_verif]
 
     def plan_and_certify(
         self, bid_payload: WorkloadBidPayload, room_id: str = ""
@@ -348,6 +435,12 @@ class PlannerSwitchAdapter(BaseSwitchAdapter):
             utilization_pct=98.0,
             ambient_temp_c=34.0,
         )
+
+        # Synchronize simulation environment to incident telemetry
+        self.simulator._workload_powers.clear()
+        for w in workloads:
+            self.simulator.set_workload_power(w.workload_id, w.current_power_w)
+        self.simulator._core_temp_c = telemetry.temperature_core_c
 
         planner_result = self.planner.plan(
             telemetry=telemetry,
@@ -495,6 +588,11 @@ class PlannerSwitchAdapter(BaseSwitchAdapter):
             "room_id": room_id,
             "timestamp": time.time(),
         }
+
+        self.state_machines[incident_id] = IncidentStateMachine(
+            incident_id=incident_id,
+            initial_state=IncidentState.AWAITING_APPROVAL,
+        )
 
         return rec_proposal, safety_result, negotiation_complete, decision_card
 

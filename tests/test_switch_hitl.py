@@ -6,11 +6,12 @@ import time
 import unittest
 from unittest.mock import AsyncMock
 
-from thermopilot.schemas import NodeConstraints
+from thermopilot.schemas import IncidentState, NodeConstraints
 from thermopilot.switch_adapter.client import SwitchHttpClient
 from thermopilot.switch_adapter.config import SwitchAdapterConfig
 from thermopilot.switch_adapter.messages import (
     ExecutionResultPayload,
+    VerificationReportPayload,
     WorkloadBidItem,
     WorkloadBidPayload,
     parse_switch_message,
@@ -345,6 +346,8 @@ class TestSwitchTimeoutAndDuplicate(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Workload mutations are strictly blocked", reply)
         self.assertIn("inc-timeout-1", self.adapter.finalized_incidents)
         self.assertNotIn("inc-timeout-1", self.adapter.active_incidents)
+        sm = self.adapter.state_machines["inc-timeout-1"]
+        self.assertEqual(sm.current_state, IncidentState.TIMEOUT_ESCALATED)
 
     async def test_duplicate_approval_rejected(self) -> None:
         """Subsequent approval attempt for finalized incident is rejected."""
@@ -385,6 +388,8 @@ class TestSwitchTimeoutAndDuplicate(unittest.IsolatedAsyncioTestCase):
         }
         reply1 = await self.adapter.handle_message_event(event)
         self.assertIn("Rejected by Operator", reply1)
+        sm = self.adapter.state_machines["inc-dup-2"]
+        self.assertEqual(sm.current_state, IncidentState.REJECTED)
 
         # Second rejection attempt
         reply2 = await self.adapter.handle_message_event(event)
@@ -549,7 +554,7 @@ class TestSwitchSimulationExecutor(unittest.IsolatedAsyncioTestCase):
         }
         res = await self.adapter.handle_message_event(event)
         self.assertIsInstance(res, list)
-        self.assertEqual(len(res), 2)
+        self.assertEqual(len(res), 3)
 
         # First message: operator authorization confirmation
         self.assertIn("Approved and Pre-Execution Certified", res[0])
@@ -563,6 +568,19 @@ class TestSwitchSimulationExecutor(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(msg_exec.revalidation_passed)
         self.assertTrue(msg_exec.is_simulated)
         self.assertGreater(msg_exec.node_power_w, 0.0)
+
+        # Third message: VerificationReportPayload
+        msg_verif = parse_switch_message(res[2])
+        self.assertIsInstance(msg_verif, VerificationReportPayload)
+        self.assertEqual(msg_verif.incident_id, "inc-exec-test")
+        self.assertEqual(msg_verif.plan_id, "PLAN-B")
+        self.assertTrue(msg_verif.recovery_successful)
+        self.assertTrue(msg_verif.reached_target)
+        self.assertLessEqual(msg_verif.final_temp_c, 75.0)
+
+        # State machine transition to RECOVERED
+        sm = self.adapter.state_machines["inc-exec-test"]
+        self.assertEqual(sm.current_state, IncidentState.RECOVERED)
 
 
 
