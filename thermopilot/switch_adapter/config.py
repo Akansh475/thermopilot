@@ -43,6 +43,15 @@ class SwitchAdapterConfig(BaseModel):
         default_factory=frozenset,
         description="Set of authorized Discord room IDs; if empty, all rooms the agent belongs to are allowed",
     )
+    authorized_operators: frozenset[str] = Field(
+        default_factory=frozenset,
+        description="Set of authorized operator usernames; if empty, any authenticated human is allowed",
+    )
+    approval_timeout_s: float = Field(
+        default=30.0,
+        gt=0.0,
+        description="Approval governance window in seconds before fail-safe timeout escalation",
+    )
     heartbeat_interval_s: float = Field(
         default=2.0,
         gt=0.0,
@@ -97,6 +106,31 @@ class SwitchAdapterConfig(BaseModel):
         if not self.authorized_room_ids:
             return True
         return room_id in self.authorized_room_ids
+
+    def is_operator_authorized(self, operator_id: str) -> bool:
+        """Check whether operator_id is an authorized human operator (agents strictly rejected)."""
+        if not operator_id or not operator_id.strip():
+            return False
+
+        clean_id = operator_id.strip().lower()
+        # Autonomous agents are strictly prohibited from acting as human approval authorities
+        forbidden_agents = {
+            "forecast-agent",
+            "workload-agent",
+            "planner-agent",
+            "thermopilot-forecast-adapter",
+            "thermopilot-workload-adapter",
+            "thermopilot-planner-adapter",
+            self.client_name.lower(),
+        }
+        if clean_id in forbidden_agents or clean_id.endswith(("-agent", "-adapter")):
+            return False
+
+        if not self.authorized_operators:
+            return True
+
+        allowed = {op.lower() for op in self.authorized_operators}
+        return clean_id in allowed
 
     def build_ws_url(
         self,
@@ -249,11 +283,27 @@ class SwitchAdapterConfig(BaseModel):
             else "thermopilot-forecast-adapter"
         )
 
+        operators_raw = os.environ.get("SWITCH_AUTHORIZED_OPERATORS") or env_dict.get(
+            "SWITCH_AUTHORIZED_OPERATORS", ""
+        )
+        authorized_operators = (
+            frozenset(op.strip() for op in operators_raw.split(",") if op.strip())
+            if operators_raw
+            else frozenset()
+        )
+
+        approval_timeout_s = float(
+            os.environ.get("SWITCH_APPROVAL_TIMEOUT_S")
+            or env_dict.get("SWITCH_APPROVAL_TIMEOUT_S", "30.0")
+        )
+
         data: dict[str, Any] = {
             "bridge_url": bridge_url,
             "agent_id": agent_id or overrides.get("agent_id"),
             "api_key": api_key or overrides.get("api_key"),
             "authorized_room_ids": authorized_rooms,
+            "authorized_operators": authorized_operators,
+            "approval_timeout_s": approval_timeout_s,
             "heartbeat_interval_s": heartbeat_s,
             "client_name": client_name,
         }

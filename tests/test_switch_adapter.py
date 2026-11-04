@@ -799,6 +799,34 @@ class TestForecastSwitchAdapter(unittest.IsolatedAsyncioTestCase):
             self.assertIn("Time-to-Throttle", reply)
             self.assertEqual(self.sim.core_temp_c, 72.0)
 
+    def test_operator_authorization_rules(self) -> None:
+        """Verify authorized operator rules and rejection of autonomous agents."""
+        cfg = SwitchAdapterConfig(
+            bridge_url="http://localhost:8000",
+            agent_id="00000000-0000-0000-0000-000000000000",
+            api_key="secret",
+            authorized_operators=frozenset(["operator-alice", "lead-sre"]),
+        )
+        self.assertTrue(cfg.is_operator_authorized("operator-alice"))
+        self.assertTrue(cfg.is_operator_authorized("lead-sre"))
+        self.assertFalse(cfg.is_operator_authorized("unauthorized-bob"))
+        self.assertFalse(cfg.is_operator_authorized(""))
+        # Autonomous agents are strictly rejected from acting as human approval authorities
+        self.assertFalse(cfg.is_operator_authorized("forecast-agent"))
+        self.assertFalse(cfg.is_operator_authorized("workload-agent"))
+        self.assertFalse(cfg.is_operator_authorized("planner-agent"))
+        self.assertFalse(cfg.is_operator_authorized("thermopilot-forecast-adapter"))
+
+        # When authorized_operators is empty, any non-agent human is allowed
+        cfg_open = SwitchAdapterConfig(
+            bridge_url="http://localhost:8000",
+            agent_id="00000000-0000-0000-0000-000000000000",
+            api_key="secret",
+            authorized_operators=frozenset(),
+        )
+        self.assertTrue(cfg_open.is_operator_authorized("operator-alex"))
+        self.assertFalse(cfg_open.is_operator_authorized("workload-agent"))
+
 
 if __name__ == "__main__":
     unittest.main()
