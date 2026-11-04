@@ -519,6 +519,23 @@ class TestForecastSwitchAdapter(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Command Reference", reply)
         self.assertIn("@ForecastAgent status", reply)
 
+    async def test_simulate_anomaly_query(self) -> None:
+        """User asks '@ForecastAgent simulate-anomaly' -> returns structured perception alert."""
+        event_data = {
+            "type": "message",
+            "room_id": "room-discord-main",
+            "payload": {
+                "addressed": True,
+                "sender_name": "operator",
+                "body": "@ForecastAgent simulate-anomaly",
+            },
+        }
+        reply = await self.adapter.handle_message_event(event_data)
+        self.assertIsNotNone(reply)
+        self.assertIn("Thermal runaway anomaly", reply)
+        self.assertIn("SIMULATED TELEMETRY", reply)
+        self.assertIn("```thermopilot", reply)
+
     async def test_execution_attempt_strictly_denied(self) -> None:
         """User attempts to trigger actuation -> strictly denied with SafetyGate reminder."""
         event_data = {

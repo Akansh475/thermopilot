@@ -191,7 +191,7 @@ class ForecastSwitchAdapter(BaseSwitchAdapter):
             "• `@ForecastAgent status` — Current temperature, power, and thermal risk level.",
             "• `@ForecastAgent forecast` — Polynomial derivative rates and predictive runaway trajectory.",
             "• `@ForecastAgent time-to-trip` (or `ttt`) — Countdown seconds to 85.0°C hardware throttle.",
-            "• `@ForecastAgent incident` (or `simulate-incident`) — Trigger simulated thermal incident for multi-agent negotiation.",
+            "• `@ForecastAgent simulate-anomaly` (or `incident`) — Trigger simulated thermal runaway anomaly for multi-agent recovery.",
             "• `@ForecastAgent help` — Display this command reference.",
             "",
             (
@@ -225,10 +225,11 @@ class ForecastSwitchAdapter(BaseSwitchAdapter):
         if any(
             k in clean_text
             for k in (
+                "simulate-anomaly",
+                "anomaly",
                 "incident",
                 "simulate-incident",
                 "trigger-incident",
-                "anomaly",
                 "runaway",
             )
         ):

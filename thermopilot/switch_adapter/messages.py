@@ -66,6 +66,10 @@ class ThermalAlertPayload(BaseModel):
     )
     risk_status: str = Field(..., description="Risk tier badge string")
     reason: str = Field(..., description="Perception rationale")
+    is_simulated: bool = Field(
+        default=True,
+        description="Explicit flag confirming simulated telemetry (zero hardware actuation)",
+    )
     timestamp: str = Field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat(),
         description="UTC ISO-8601 timestamp",
@@ -284,7 +288,7 @@ def format_discord_message(payload: SwitchMessagePayload) -> str:
             else "N/A"
         )
         body = (
-            f"🚨 **[ThermoPilot Perception Alert]** Thermal runaway anomaly on GPU #{payload.gpu_id}!\n"
+            f"🚨 **[ThermoPilot Perception Alert]** Thermal runaway anomaly on GPU #{payload.gpu_id} [SIMULATED TELEMETRY]!\n"
             f"• **Incident ID:** `{payload.incident_id}`\n"
             f"• **Current Core Temp:** `{payload.current_temp_c:.1f}°C` (Trip Limit: `{payload.critical_threshold_c:.1f}°C`)\n"
             f"• **Time-to-Throttle (t_TTT):** {ttt_str}\n"
