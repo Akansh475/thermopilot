@@ -90,6 +90,109 @@ class PlannerSwitchAdapter(BaseSwitchAdapter):
         ]
         return "\n".join(lines)
 
+    def parse_governance_command(
+        self, text: str
+    ) -> tuple[str, str | None, str | None]:
+        """Parse operator approval or rejection command.
+
+        Returns:
+            (command, incident_id, plan_id) where command is 'approve', 'reject', or ''.
+        """
+        tokens = [t.strip(",.:;") for t in text.split() if t.strip(",.:;")]
+        if not tokens:
+            return "", None, None
+
+        cmd = tokens[0].lower()
+        if cmd not in ("approve", "reject"):
+            return "", None, None
+
+        incident_id: str | None = None
+        plan_id: str | None = None
+
+        if cmd == "approve":
+            remaining = tokens[1:]
+            if len(remaining) == 1:
+                token = remaining[0]
+                if token.upper().startswith("PLAN-") or token.upper() in (
+                    "PLAN_A",
+                    "PLAN_B",
+                    "PLAN_C",
+                    "PLAN_D",
+                    "A",
+                    "B",
+                    "C",
+                    "D",
+                ):
+                    plan_id = (
+                        token.upper()
+                        if token.upper().startswith("PLAN-")
+                        else f"PLAN-{token.upper()}"
+                    )
+                elif token in self.active_incidents or token.startswith("inc-"):
+                    incident_id = token
+                else:
+                    plan_id = token.upper()
+            elif len(remaining) >= 2:
+                t1, t2 = remaining[0], remaining[1]
+                if t1.upper().startswith("PLAN-") or t1.upper() in ("A", "B", "C", "D"):
+                    plan_id = (
+                        t1.upper()
+                        if t1.upper().startswith("PLAN-")
+                        else f"PLAN-{t1.upper()}"
+                    )
+                    incident_id = t2
+                else:
+                    incident_id = t1
+                    plan_id = (
+                        t2.upper()
+                        if t2.upper().startswith("PLAN-")
+                        else (
+                            f"PLAN-{t2.upper()}"
+                            if t2.upper() in ("A", "B", "C", "D")
+                            else t2.upper()
+                        )
+                    )
+
+        elif cmd == "reject":
+            remaining = tokens[1:]
+            if len(remaining) >= 1:
+                incident_id = remaining[0]
+
+        # Infer incident_id if unambiguous
+        if incident_id is None and len(self.active_incidents) == 1:
+            incident_id = next(iter(self.active_incidents))
+
+        return cmd, incident_id, plan_id
+
+    async def handle_governance_decision(
+        self,
+        room_id: str,
+        cmd: str,
+        incident_id: str,
+        plan_id: str | None,
+        operator_id: str,
+        incident_context: dict[str, Any],
+    ) -> str:
+        """Handle validated operator approval or rejection command."""
+        if cmd == "reject":
+            reply = (
+                f"🛑 **Incident `{incident_id}` Rejected by Operator `{operator_id}`.** "
+                "All recovery plans cancelled. Workloads remain in their current state."
+                + ADVISORY_FOOTER
+            )
+            self.active_incidents.pop(incident_id, None)
+            await self.http_client.send_message(room_id=room_id, content=reply)
+            return reply
+
+        # Approve command
+        reply = (
+            f"✅ **Plan `{plan_id}` Approved by Operator `{operator_id}` for Incident `{incident_id}`.** "
+            "Dispatching pre-execution SafetyGate verification."
+            + ADVISORY_FOOTER
+        )
+        await self.http_client.send_message(room_id=room_id, content=reply)
+        return reply
+
     def plan_and_certify(
         self, bid_payload: WorkloadBidPayload, room_id: str = ""
     ) -> tuple[
@@ -307,20 +410,12 @@ class PlannerSwitchAdapter(BaseSwitchAdapter):
             return None
 
         body = payload.get("body", "")
-        clean_text = re.sub(r"@\S+", "", body).strip().lower()
+        clean_text = re.sub(r"@\S+", "", body).strip()
+        clean_lower = clean_text.lower()
 
-        # 1. Defense-in-depth: Reject any attempt to trigger workload actions from chat
-        if any(
-            k in clean_text
-            for k in (
-                "approve",
-                "execute",
-                "apply",
-                "kill",
-                "throttle now",
-                "mitigate",
-            )
-        ):
+        # 1. Defense-in-depth: Reject non-approval chat execution commands
+        MUTATION_KEYWORDS = ("execute", "apply", "kill", "throttle now", "mitigate")
+        if any(k in clean_lower for k in MUTATION_KEYWORDS):
             reply = (
                 "⚠️ **Execution Denied:** Recovery plans cannot be executed from chat. "
                 "In ThermoPilot Compute Desk, all mitigation proposals require deterministic SafetyGate "
@@ -329,6 +424,83 @@ class PlannerSwitchAdapter(BaseSwitchAdapter):
             )
             await self.http_client.send_message(room_id=room_id, content=reply)
             return reply
+
+        # 2. Check for HITL governance command (approve / reject)
+        cmd, inc_id, p_id = self.parse_governance_command(clean_text)
+        if cmd in ("approve", "reject"):
+            # Check operator authorization
+            if not self.config.is_operator_authorized(sender_name):
+                if sender_name.endswith(("-agent", "-adapter")) or sender_name in (
+                    "forecast-agent",
+                    "workload-agent",
+                    "planner-agent",
+                ):
+                    reply = (
+                        "⚠️ **Execution Denied: Autonomous agents cannot authorize execution.** "
+                        "In ThermoPilot Compute Desk, all mitigation proposals require authenticated "
+                        "human operator sign-off at the governance desk."
+                        + ADVISORY_FOOTER
+                    )
+                else:
+                    reply = (
+                        f"⚠️ **Execution Denied: Unauthorized Operator.** "
+                        f"User '{sender_name}' is not authorized to submit recovery plan governance decisions. "
+                        f"Only designated human operators may approve or reject plans."
+                        + ADVISORY_FOOTER
+                    )
+                await self.http_client.send_message(room_id=room_id, content=reply)
+                return reply
+
+            # Validate incident binding
+            if not inc_id:
+                if not self.active_incidents:
+                    reply = (
+                        "⚠️ **Execution Denied: No Active Incident.** "
+                        "There are currently no pending incidents awaiting operator approval."
+                        + ADVISORY_FOOTER
+                    )
+                else:
+                    reply = (
+                        f"⚠️ **Incident ID Required:** Please specify the incident ID. "
+                        f"Usage: `@planner-agent {cmd} <incident_id>"
+                        + (" <plan_id>`" if cmd == "approve" else "`")
+                        + ADVISORY_FOOTER
+                    )
+                await self.http_client.send_message(room_id=room_id, content=reply)
+                return reply
+
+            if inc_id not in self.active_incidents:
+                reply = (
+                    f"⚠️ **Execution Denied: Unknown Incident.** "
+                    f"Incident '{inc_id}' was not found in active incidents or has already been resolved."
+                    + ADVISORY_FOOTER
+                )
+                await self.http_client.send_message(room_id=room_id, content=reply)
+                return reply
+
+            incident_context = self.active_incidents[inc_id]
+
+            if cmd == "approve" and not p_id:
+                candidate_ids = [
+                    c.plan_id for c in incident_context["card"].candidate_plans
+                ]
+                reply = (
+                    f"⚠️ **Plan ID Required:** Please specify which candidate plan to approve for incident '{inc_id}'. "
+                    f"Available candidates: {', '.join(candidate_ids)}. "
+                    f"Usage: `@planner-agent approve {inc_id} <plan_id>`"
+                    + ADVISORY_FOOTER
+                )
+                await self.http_client.send_message(room_id=room_id, content=reply)
+                return reply
+
+            return await self.handle_governance_decision(
+                room_id=room_id,
+                cmd=cmd,
+                incident_id=inc_id,
+                plan_id=p_id,
+                operator_id=sender_name,
+                incident_context=incident_context,
+            )
 
         # 2. Check for structured ThermoPilot negotiation message
         msg = parse_switch_message(body)
