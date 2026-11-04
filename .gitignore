@@ -1,0 +1,17 @@
+# Environment and secrets
+.env
+*.env
+.switch_connection_id
+
+# Runtime audit logs
+.audit/
+
+# Python bytecode and caches
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
