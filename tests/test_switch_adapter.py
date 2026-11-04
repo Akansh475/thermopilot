@@ -112,6 +112,44 @@ class TestSwitchAdapterConfig(unittest.TestCase):
             self.assertEqual(cfg.api_key, "sw_ak_envsecret9999")
             self.assertEqual(cfg.authorized_room_ids, frozenset(["room-a", "room-b"]))
             self.assertEqual(cfg.heartbeat_interval_s, 1.5)
+            self.assertEqual(cfg.client_name, "thermopilot-forecast-adapter")
+
+    def test_from_env_with_roles(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {
+                "SWITCH_BRIDGE_URL": "http://127.0.0.1:9000",
+                "SWITCH_PLANNER_AGENT_ID": "11111111-2222-3333-4444-555555555555",
+                "SWITCH_PLANNER_API_KEY": "sw_ak_planner_secret",
+                "SWITCH_WORKLOAD_AGENT_ID": "22222222-3333-4444-5555-666666666666",
+                "SWITCH_WORKLOAD_API_KEY": "sw_ak_workload_secret",
+            },
+        ):
+            cfg_planner = SwitchAdapterConfig.from_env(
+                env_file=None, connection_id_file=None, role="planner"
+            )
+            self.assertEqual(
+                cfg_planner.agent_id, "11111111-2222-3333-4444-555555555555"
+            )
+            self.assertEqual(cfg_planner.api_key, "sw_ak_planner_secret")
+            self.assertEqual(cfg_planner.client_name, "thermopilot-planner-adapter")
+
+            cfg_workload = SwitchAdapterConfig.from_env(
+                env_file=None, connection_id_file=None, role="workload"
+            )
+            self.assertEqual(
+                cfg_workload.agent_id, "22222222-3333-4444-5555-666666666666"
+            )
+            self.assertEqual(cfg_workload.api_key, "sw_ak_workload_secret")
+            self.assertEqual(cfg_workload.client_name, "thermopilot-workload-adapter")
+
+    def test_from_env_with_role_missing_raises(self) -> None:
+        with patch.dict("os.environ", {}, clear=True):
+            with self.assertRaises(ValueError) as ctx:
+                SwitchAdapterConfig.from_env(
+                    env_file=None, connection_id_file=None, role="planner"
+                )
+            self.assertIn("role 'planner'", str(ctx.exception))
 
 
 class TestSwitchHttpClient(unittest.IsolatedAsyncioTestCase):

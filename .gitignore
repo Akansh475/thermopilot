@@ -2,6 +2,7 @@
 .env
 *.env
 .switch_connection_id
+.switch_*_connection_id
 
 # Runtime audit logs
 .audit/

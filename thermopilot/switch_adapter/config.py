@@ -143,14 +143,15 @@ class SwitchAdapterConfig(BaseModel):
         cls,
         env_file: Path | str | None = ".env",
         connection_id_file: Path | str | None = ".switch_connection_id",
+        role: str | None = None,
         **overrides: Any,
     ) -> SwitchAdapterConfig:
         """Construct configuration from environment variables.
 
         Supported Environment Variables:
         - SWITCH_BRIDGE_URL: Switch agent bridge base URL (default: http://localhost:8000)
-        - SWITCH_AGENT_ID: Switch agent UUID identifier
-        - SWITCH_API_KEY: Agent Bearer authentication token
+        - SWITCH_AGENT_ID: Switch agent UUID identifier (or SWITCH_{ROLE}_AGENT_ID if role specified)
+        - SWITCH_API_KEY: Agent Bearer authentication token (or SWITCH_{ROLE}_API_KEY)
         - SWITCH_CONNECTION_ID: Connection UUID (if unset, loads/saves to connection_id_file)
         - SWITCH_AUTHORIZED_ROOM_IDS: Comma-separated list of permitted room IDs
         - SWITCH_HEARTBEAT_INTERVAL_S: Float seconds between beats (default: 2.0)
@@ -171,13 +172,32 @@ class SwitchAdapterConfig(BaseModel):
         bridge_url = os.environ.get("SWITCH_BRIDGE_URL") or env_dict.get(
             "SWITCH_BRIDGE_URL", "http://localhost:8000"
         )
-        agent_id = os.environ.get("SWITCH_AGENT_ID") or env_dict.get("SWITCH_AGENT_ID")
-        api_key = os.environ.get("SWITCH_API_KEY") or env_dict.get("SWITCH_API_KEY")
+        if role:
+            prefix = f"SWITCH_{role.upper()}_"
+            agent_id = os.environ.get(f"{prefix}AGENT_ID") or env_dict.get(
+                f"{prefix}AGENT_ID"
+            )
+            api_key = os.environ.get(f"{prefix}API_KEY") or env_dict.get(
+                f"{prefix}API_KEY"
+            )
+            if connection_id_file == ".switch_connection_id":
+                connection_id_file = f".switch_{role.lower()}_connection_id"
+        else:
+            agent_id = os.environ.get("SWITCH_AGENT_ID") or env_dict.get(
+                "SWITCH_AGENT_ID"
+            )
+            api_key = os.environ.get("SWITCH_API_KEY") or env_dict.get("SWITCH_API_KEY")
 
         if not agent_id and "agent_id" not in overrides:
-            raise ValueError("SWITCH_AGENT_ID environment variable is required")
+            role_hint = f" for role '{role}'" if role else ""
+            raise ValueError(
+                f"SWITCH_AGENT_ID environment variable is required{role_hint}"
+            )
         if not api_key and "api_key" not in overrides:
-            raise ValueError("SWITCH_API_KEY environment variable is required")
+            role_hint = f" for role '{role}'" if role else ""
+            raise ValueError(
+                f"SWITCH_API_KEY environment variable is required{role_hint}"
+            )
 
         # Persistent connection ID resolution
         conn_id = os.environ.get("SWITCH_CONNECTION_ID") or env_dict.get(
@@ -213,12 +233,19 @@ class SwitchAdapterConfig(BaseModel):
             or env_dict.get("SWITCH_HEARTBEAT_INTERVAL_S", "2.0")
         )
 
+        client_name = (
+            f"thermopilot-{role.lower()}-adapter"
+            if role
+            else "thermopilot-forecast-adapter"
+        )
+
         data: dict[str, Any] = {
             "bridge_url": bridge_url,
             "agent_id": agent_id or overrides.get("agent_id"),
             "api_key": api_key or overrides.get("api_key"),
             "authorized_room_ids": authorized_rooms,
             "heartbeat_interval_s": heartbeat_s,
+            "client_name": client_name,
         }
         if conn_id:
             data["connection_id"] = conn_id
