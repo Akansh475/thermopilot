@@ -26,12 +26,16 @@ from thermopilot.switch_adapter.client import (
 )
 from thermopilot.switch_adapter.config import SwitchAdapterConfig
 from thermopilot.switch_adapter.messages import (
+    DecisionCardItem,
+    DecisionCardPayload,
+    ExecutionResultPayload,
     NegotiationCompletePayload,
     RecoveryCandidateItem,
     RecoveryProposalPayload,
     SafetyEvaluationItem,
     SafetyResultPayload,
     ThermalAlertPayload,
+    VerificationReportPayload,
     WorkloadActionItem,
     WorkloadBidItem,
     WorkloadBidPayload,
@@ -230,6 +234,100 @@ class TestSwitchMultiAgent(unittest.IsolatedAsyncioTestCase):
         parsed_comp = parse_switch_message(txt)
         self.assertIsInstance(parsed_comp, NegotiationCompletePayload)
         self.assertEqual(parsed_comp.recommended_plan_id, "PLAN-B")
+
+        # F. Decision Card
+        card = DecisionCardPayload(
+            incident_id="inc-test-1",
+            current_temp_c=82.5,
+            current_power_w=380.0,
+            candidate_plans=[
+                DecisionCardItem(
+                    plan_id="PLAN-B",
+                    name="Balanced Dynamic Power Cap",
+                    strategy_type="BALANCED_POWER_CAP",
+                    is_recommended=True,
+                    is_safe=True,
+                    safety_verdict="CERTIFIED_SAFE",
+                    projected_temp_max_c=76.4,
+                    projected_power_w=380.0,
+                    cooling_time_to_safe_s=12.0,
+                    estimated_cost_usd=12.0,
+                    sla_violations_expected=0,
+                    actions_summary="Alpha 220W, Beta 160W",
+                    is_executable=True,
+                ),
+                DecisionCardItem(
+                    plan_id="PLAN-D",
+                    name="Blind 50% Throttle",
+                    strategy_type="UNSAFE_THROTTLE",
+                    is_recommended=False,
+                    is_safe=False,
+                    safety_verdict="REJECTED_BY_SAFETY_GATE",
+                    rejection_reasons=["Violates RULE_MIN_POWER_FLOOR"],
+                    projected_temp_max_c=70.0,
+                    projected_power_w=200.0,
+                    cooling_time_to_safe_s=8.0,
+                    estimated_cost_usd=500.0,
+                    sla_violations_expected=1,
+                    actions_summary="Alpha 125W, Beta 75W",
+                    is_executable=False,
+                ),
+            ],
+            executable_plan_ids=["PLAN-B"],
+            rejected_plan_ids=["PLAN-D"],
+            approval_command="@planner-agent approve inc-test-1 PLAN-B",
+            rejection_command="@planner-agent reject inc-test-1",
+        )
+        txt = format_discord_message(card)
+        self.assertIn("⚖️ **[ThermoPilot HITL Governance Desk]**", txt)
+        self.assertIn("@planner-agent approve", txt)
+        parsed_card = parse_switch_message(txt)
+        self.assertIsInstance(parsed_card, DecisionCardPayload)
+        self.assertEqual(parsed_card.incident_id, "inc-test-1")
+        self.assertEqual(parsed_card.executable_plan_ids, ["PLAN-B"])
+        self.assertEqual(parsed_card.rejected_plan_ids, ["PLAN-D"])
+
+        # G. Execution Result
+        exec_res = ExecutionResultPayload(
+            incident_id="inc-test-1",
+            execution_id="exec-12345",
+            plan_id="PLAN-B",
+            operator_id="operator-alice",
+            success=True,
+            applied_actions=[
+                {
+                    "workload_id": "wl-alpha",
+                    "action": "POWER_CAP",
+                    "target_power_w": 220.0,
+                }
+            ],
+            node_power_w=380.0,
+            revalidation_passed=True,
+        )
+        txt = format_discord_message(exec_res)
+        self.assertIn("⚡ **[ThermoPilot Actuation Report]**", txt)
+        parsed_exec = parse_switch_message(txt)
+        self.assertIsInstance(parsed_exec, ExecutionResultPayload)
+        self.assertTrue(parsed_exec.success)
+
+        # H. Verification Report
+        verif = VerificationReportPayload(
+            incident_id="inc-test-1",
+            verification_id="verif-12345",
+            plan_id="PLAN-B",
+            recovery_successful=True,
+            initial_temp_c=82.5,
+            final_temp_c=74.2,
+            cooling_rate_c_per_s=-0.415,
+            reached_target=True,
+            ticks_to_target=14,
+            audit_hash="a1b2c3d4e5f607182930",
+        )
+        txt = format_discord_message(verif)
+        self.assertIn("🎯 **[ThermoPilot Verification Report]**", txt)
+        parsed_verif = parse_switch_message(txt)
+        self.assertIsInstance(parsed_verif, VerificationReportPayload)
+        self.assertTrue(parsed_verif.recovery_successful)
 
     def test_parse_invalid_or_non_json_messages(self) -> None:
         """Verify parser returns None for unstructured chat text."""

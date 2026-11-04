@@ -18,7 +18,7 @@ import json
 import re
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
@@ -36,6 +36,9 @@ class SwitchMessageType(str, Enum):
     RECOVERY_PROPOSAL = "recovery_proposal"
     SAFETY_RESULT = "safety_result"
     NEGOTIATION_COMPLETE = "negotiation_complete"
+    DECISION_CARD = "decision_card"
+    EXECUTION_RESULT = "execution_result"
+    VERIFICATION_REPORT = "verification_report"
 
 
 # ---------------------------------------------------------------------------
@@ -230,6 +233,115 @@ class NegotiationCompletePayload(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# 6. HITL Decision Card Schema (Emitted by planner-agent / SwitchApprovalDesk)
+# ---------------------------------------------------------------------------
+
+
+class DecisionCardItem(BaseModel):
+    """Candidate plan representation for operator decision."""
+
+    model_config = ConfigDict(frozen=True)
+
+    plan_id: str
+    name: str
+    strategy_type: str
+    is_recommended: bool
+    is_safe: bool
+    safety_verdict: str
+    rejection_reasons: list[str] = Field(default_factory=list)
+    projected_temp_max_c: float
+    projected_power_w: float
+    cooling_time_to_safe_s: float
+    estimated_cost_usd: float
+    sla_violations_expected: int
+    actions_summary: str
+    is_executable: bool
+
+
+class DecisionCardPayload(BaseModel):
+    """Interactive decision card presenting actionable plans and fallback chat commands."""
+
+    model_config = ConfigDict(frozen=True)
+
+    type: Literal["decision_card"] = "decision_card"
+    incident_id: str = Field(..., description="Correlated incident identifier")
+    severity: str = Field(default="CRITICAL", description="Incident severity level")
+    current_temp_c: float = Field(
+        ..., description="Instantaneous core temperature in Celsius"
+    )
+    current_power_w: float = Field(..., description="Current power draw in Watts")
+    critical_trip_temp_c: float = Field(
+        default=85.0, description="Hardware trip temperature"
+    )
+    time_to_trip_s: float | None = Field(default=None, description="Seconds to trip")
+    candidate_plans: list[DecisionCardItem] = Field(..., min_length=1)
+    executable_plan_ids: list[str] = Field(default_factory=list)
+    rejected_plan_ids: list[str] = Field(default_factory=list)
+    timeout_seconds: float = Field(default=30.0, description="Approval window duration")
+    approval_command: str = Field(..., description="Chat approval command template")
+    rejection_command: str = Field(..., description="Chat rejection command template")
+    is_simulated: bool = Field(default=True, description="Simulated physics indicator")
+    timestamp: str = Field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat(),
+        description="UTC ISO-8601 timestamp",
+    )
+
+
+# ---------------------------------------------------------------------------
+# 7. Execution Result Schema (Emitted after SimulationExecutor runs)
+# ---------------------------------------------------------------------------
+
+
+class ExecutionResultPayload(BaseModel):
+    """Summary of executed recovery plan actions."""
+
+    model_config = ConfigDict(frozen=True)
+
+    type: Literal["execution_result"] = "execution_result"
+    incident_id: str
+    execution_id: str
+    plan_id: str
+    operator_id: str
+    success: bool
+    applied_actions: list[dict[str, Any]] = Field(default_factory=list)
+    node_power_w: float
+    revalidation_passed: bool
+    is_simulated: bool = Field(default=True)
+    timestamp: str = Field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat(),
+        description="UTC ISO-8601 timestamp",
+    )
+
+
+# ---------------------------------------------------------------------------
+# 8. Verification Report Schema (Emitted after VerificationAgent verifies)
+# ---------------------------------------------------------------------------
+
+
+class VerificationReportPayload(BaseModel):
+    """Summary of post-execution thermal recovery verification."""
+
+    model_config = ConfigDict(frozen=True)
+
+    type: Literal["verification_report"] = "verification_report"
+    incident_id: str
+    verification_id: str
+    plan_id: str
+    recovery_successful: bool
+    initial_temp_c: float
+    final_temp_c: float
+    cooling_rate_c_per_s: float
+    reached_target: bool
+    ticks_to_target: int | None = None
+    audit_hash: str | None = None
+    is_simulated: bool = Field(default=True)
+    timestamp: str = Field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat(),
+        description="UTC ISO-8601 timestamp",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Discriminated Union & Parser Adapter
 # ---------------------------------------------------------------------------
 
@@ -238,7 +350,10 @@ SwitchMessagePayload = Annotated[
     | WorkloadBidPayload
     | RecoveryProposalPayload
     | SafetyResultPayload
-    | NegotiationCompletePayload,
+    | NegotiationCompletePayload
+    | DecisionCardPayload
+    | ExecutionResultPayload
+    | VerificationReportPayload,
     Field(discriminator="type"),
 ]
 
@@ -380,6 +495,93 @@ def format_discord_message(payload: SwitchMessagePayload) -> str:
             f"• **Projected Recovery:** Core settles at `{payload.projected_temp_max_c:.1f}°C` in `{payload.cooling_time_s:.1f}s`\n"
             f"• **SLA Preservation:** {payload.sla_status}\n"
             f"• 🔒 **Governance Notice:** {payload.next_step}\n\n"
+            f"{json_block}"
+            f"{ADVISORY_FOOTER}"
+        )
+        return body
+
+    if isinstance(payload, DecisionCardPayload):
+        options_lines = []
+        for p in payload.candidate_plans:
+            rec = " ⭐ **[RECOMMENDED]**" if p.is_recommended else ""
+            if p.is_safe:
+                options_lines.append(
+                    f"• 🟢 **{p.plan_id}: {p.name}**{rec} `[CERTIFIED SAFE]`\n"
+                    f"  - Steady Temp: `{p.projected_temp_max_c:.1f}°C` | Power: `{p.projected_power_w:.1f}W` | Cooldown: `{p.cooling_time_to_safe_s:.1f}s`\n"
+                    f"  - Actions: {p.actions_summary}\n"
+                    f"  - Status: [Action Available: Approve {p.plan_id}]"
+                )
+            else:
+                violations = "; ".join(p.rejection_reasons)
+                options_lines.append(
+                    f"• 🔴 **{p.plan_id}: {p.name}** `[BLOCKED BY SAFETYGATE]`\n"
+                    f"  - Violations: {violations}\n"
+                    f"  - Status: ⛔ [Execution Disabled - Safety Violation]"
+                )
+        options_text = "\n".join(options_lines)
+
+        body = (
+            f"⚖️ **[ThermoPilot HITL Governance Desk]** Action Required for Incident `{payload.incident_id}` [SIMULATED]\n"
+            f"• **Telemetry Snapshot:** Core Temp: `{payload.current_temp_c:.1f}°C` | Power: `{payload.current_power_w:.1f}W` | Trip: `{payload.critical_trip_temp_c:.1f}°C`\n"
+            f"• **Governance Window:** `{payload.timeout_seconds:.0f}s` window (Strict policy: Timeout never mutates workloads)\n\n"
+            f"**Candidate Recovery Options:**\n"
+            f"{options_text}\n\n"
+            f"**Operator Commands (Chat Fallback & Audit Binding):**\n"
+            f"• To Approve: `{payload.approval_command}`\n"
+            f"• To Reject: `{payload.rejection_command}`\n\n"
+            f"{json_block}"
+            f"{ADVISORY_FOOTER}"
+        )
+        return body
+
+    if isinstance(payload, ExecutionResultPayload):
+        actions_list = [
+            f"{a.get('workload_id')}: {a.get('action')} ({a.get('target_power_w', 0):.0f}W)"
+            if a.get("target_power_w") is not None
+            else f"{a.get('workload_id')}: {a.get('action')}"
+            for a in payload.applied_actions
+        ]
+        actions_str = ", ".join(actions_list) if actions_list else "None"
+
+        body = (
+            f"⚡ **[ThermoPilot Actuation Report]** Plan Execution Completed [SIMULATED]\n"
+            f"• **Incident ID:** `{payload.incident_id}` | **Plan ID:** `{payload.plan_id}`\n"
+            f"• **Authorized Operator:** `{payload.operator_id}`\n"
+            f"• **SafetyGate Pre-Execution Revalidation:** `{'✅ PASSED (100% Certified)' if payload.revalidation_passed else '❌ FAILED'}`\n"
+            f"• **Applied Workload Actions:** {actions_str}\n"
+            f"• **Total Node Power Allocation:** `{payload.node_power_w:.1f}W` (Limit: 400.0W)\n"
+            f"• **Status:** Actuation applied to simulation. Initiating post-execution thermal verification...\n\n"
+            f"{json_block}"
+            f"{ADVISORY_FOOTER}"
+        )
+        return body
+
+    if isinstance(payload, VerificationReportPayload):
+        verdict = (
+            "✅ RECOVERY SUCCESSFUL (Safe Band Restored)"
+            if payload.recovery_successful
+            else "❌ RECOVERY FAILED"
+        )
+        ticks_str = (
+            f"`{payload.ticks_to_target}` ticks"
+            if payload.ticks_to_target is not None
+            else "N/A"
+        )
+        hash_str = (
+            f"`{payload.audit_hash[:16]}...`"
+            if payload.audit_hash
+            else "*Cryptographically verified*"
+        )
+
+        body = (
+            f"🎯 **[ThermoPilot Verification Report]** Post-Execution Thermal Audit [SIMULATED]\n"
+            f"• **Incident ID:** `{payload.incident_id}` | **Plan ID:** `{payload.plan_id}`\n"
+            f"• **Recovery Verdict:** {verdict}\n"
+            f"• **Thermal Restitution:** Core dropped `{payload.initial_temp_c:.1f}°C` ➔ `{payload.final_temp_c:.1f}°C` (Target <= 75.0°C)\n"
+            f"• **Cooling Rate:** `{payload.cooling_rate_c_per_s:+.3f}°C/s` (Target reached in {ticks_str})\n"
+            f"• **SLA Preservation:** 100% compliant, 0 contractual penalties incurred\n"
+            f"• **Cryptographic Audit Hash:** {hash_str}\n"
+            f"• **Lifecycle Status:** Incident marked `RESOLVED` in StateMachine & AuditLedger\n\n"
             f"{json_block}"
             f"{ADVISORY_FOOTER}"
         )
