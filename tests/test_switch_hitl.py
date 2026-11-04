@@ -153,3 +153,106 @@ class TestSwitchHitlBinding(unittest.IsolatedAsyncioTestCase):
         reply = await self.adapter.handle_message_event(event)
         self.assertIsNotNone(reply)
         self.assertIn("Plan ID Required", reply)
+
+
+class TestSwitchOperatorAuthorization(unittest.IsolatedAsyncioTestCase):
+    """Test suite for operator authorization and security boundaries."""
+
+    def setUp(self) -> None:
+        self.room_id = "test-room-auth"
+        self.config = SwitchAdapterConfig(
+            agent_id="test-planner-id",
+            api_key="test-planner-key",
+            client_name="planner-agent",
+            allowed_rooms=frozenset({self.room_id}),
+            authorized_operators=frozenset({"operator-alice", "oncall-bob"}),
+            approval_timeout_s=30.0,
+        )
+        self.mock_http = AsyncMock(spec=SwitchHttpClient)
+        self.adapter = PlannerSwitchAdapter(self.config, http_client=self.mock_http)
+
+        # Seed an active incident
+        bids = WorkloadBidPayload(
+            incident_id="inc-auth-test",
+            proposals=[
+                WorkloadBidItem(
+                    workload_id="wl-alpha",
+                    name="Alpha",
+                    priority="P0_CRITICAL",
+                    current_power_w=250.0,
+                    min_power_w=200.0,
+                    requested_power_w=220.0,
+                    can_preempt=False,
+                    sla_importance_score=0.9,
+                    rationale="Critical",
+                    estimated_trade_off="None",
+                )
+            ],
+        )
+        self.adapter.plan_and_certify(bids, room_id=self.room_id)
+
+    async def test_autonomous_agents_strictly_blocked_from_approving(self) -> None:
+        """Autonomous agents must never be permitted to approve recovery plans."""
+        for agent_sender in ("forecast-agent", "workload-agent", "eval-agent", "custom-adapter"):
+            event = {
+                "type": "message",
+                "room_id": self.room_id,
+                "payload": {
+                    "sender_name": agent_sender,
+                    "addressed": True,
+                    "body": "@planner-agent approve inc-auth-test PLAN-B",
+                },
+            }
+            reply = await self.adapter.handle_message_event(event)
+            self.assertIsNotNone(reply)
+            self.assertIn("Autonomous agents cannot authorize execution", reply)
+            self.assertIn("Execution Denied", reply)
+
+    async def test_unauthorized_user_blocked_from_approving(self) -> None:
+        """Arbitrary chat users not in authorized_operators must be rejected."""
+        event = {
+            "type": "message",
+            "room_id": self.room_id,
+            "payload": {
+                "sender_name": "mallory-attacker",
+                "addressed": True,
+                "body": "@planner-agent approve inc-auth-test PLAN-B",
+            },
+        }
+        reply = await self.adapter.handle_message_event(event)
+        self.assertIsNotNone(reply)
+        self.assertIn("Unauthorized Operator", reply)
+        self.assertIn("Execution Denied", reply)
+
+    async def test_authorized_human_operator_allowed(self) -> None:
+        """Authorized operator approvals are accepted through the security check."""
+        event = {
+            "type": "message",
+            "room_id": self.room_id,
+            "payload": {
+                "sender_name": "operator-alice",
+                "addressed": True,
+                "body": "@planner-agent approve inc-auth-test PLAN-B",
+            },
+        }
+        reply = await self.adapter.handle_message_event(event)
+        self.assertIsNotNone(reply)
+        self.assertIn("Plan `PLAN-B` Approved by Operator `operator-alice`", reply)
+
+    async def test_non_approval_mutation_commands_rejected_for_everyone(self) -> None:
+        """Raw execution or mitigation commands in chat are blocked even for authorized operators."""
+        for cmd in ("execute PLAN-B", "apply changes", "kill wl-alpha", "throttle now", "mitigate"):
+            event = {
+                "type": "message",
+                "room_id": self.room_id,
+                "payload": {
+                    "sender_name": "operator-alice",
+                    "addressed": True,
+                    "body": f"@planner-agent {cmd}",
+                },
+            }
+            reply = await self.adapter.handle_message_event(event)
+            self.assertIsNotNone(reply)
+            self.assertIn("Recovery plans cannot be executed from chat", reply)
+            self.assertIn("Execution Denied", reply)
+
