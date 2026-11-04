@@ -172,7 +172,7 @@ class SwitchAdapterConfig(BaseModel):
         bridge_url = os.environ.get("SWITCH_BRIDGE_URL") or env_dict.get(
             "SWITCH_BRIDGE_URL", "http://localhost:8000"
         )
-        if role:
+        if role and role.lower() != "forecast":
             prefix = f"SWITCH_{role.upper()}_"
             agent_id = os.environ.get(f"{prefix}AGENT_ID") or env_dict.get(
                 f"{prefix}AGENT_ID"
@@ -183,10 +183,20 @@ class SwitchAdapterConfig(BaseModel):
             if connection_id_file == ".switch_connection_id":
                 connection_id_file = f".switch_{role.lower()}_connection_id"
         else:
-            agent_id = os.environ.get("SWITCH_AGENT_ID") or env_dict.get(
-                "SWITCH_AGENT_ID"
+            agent_id = (
+                os.environ.get("SWITCH_FORECAST_AGENT_ID")
+                or env_dict.get("SWITCH_FORECAST_AGENT_ID")
+                or os.environ.get("SWITCH_AGENT_ID")
+                or env_dict.get("SWITCH_AGENT_ID")
             )
-            api_key = os.environ.get("SWITCH_API_KEY") or env_dict.get("SWITCH_API_KEY")
+            api_key = (
+                os.environ.get("SWITCH_FORECAST_API_KEY")
+                or env_dict.get("SWITCH_FORECAST_API_KEY")
+                or os.environ.get("SWITCH_API_KEY")
+                or env_dict.get("SWITCH_API_KEY")
+            )
+            if role and connection_id_file == ".switch_connection_id":
+                connection_id_file = f".switch_{role.lower()}_connection_id"
 
         if not agent_id and "agent_id" not in overrides:
             role_hint = f" for role '{role}'" if role else ""

@@ -14,9 +14,9 @@ Strictly Read-Only & Simulation Guarded:
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import re
+from datetime import datetime, timezone
 from typing import Any
 
 from thermopilot.agents.forecast import (
@@ -26,21 +26,23 @@ from thermopilot.agents.forecast import (
     ThermalRiskStatus,
 )
 from thermopilot.simulator.telemetry import TelemetrySimulator
+from thermopilot.switch_adapter.base import BaseSwitchAdapter
 from thermopilot.switch_adapter.client import (
-    SwitchAuthError,
-    SwitchEvictedError,
     SwitchHttpClient,
     SwitchSSEClient,
     SwitchWebSocketClient,
 )
 from thermopilot.switch_adapter.config import SwitchAdapterConfig
+from thermopilot.switch_adapter.messages import (
+    ADVISORY_FOOTER,
+    ThermalAlertPayload,
+    format_discord_message,
+)
 
 logger = logging.getLogger(__name__)
 
-ADVISORY_FOOTER = "\n\n> 🛡️ **ThermoPilot Compute Desk** | *Advisory Only · Simulated Physics · Zero Hardware Actuation*"
 
-
-class ForecastSwitchAdapter:
+class ForecastSwitchAdapter(BaseSwitchAdapter):
     """Bridges Switch Agent Protocol rooms to the ThermoPilot ForecastAgent via WebSocket."""
 
     def __init__(
@@ -52,30 +54,9 @@ class ForecastSwitchAdapter:
         ws_client: SwitchWebSocketClient | None = None,
         sse_client: SwitchSSEClient | None = None,
     ) -> None:
-        self.config = config
+        super().__init__(config, http_client, ws_client, sse_client)
         self.forecast_agent = forecast_agent or ForecastAgent(ForecastConfig())
         self.simulator = simulator or TelemetrySimulator()
-        self.http_client = http_client or SwitchHttpClient(self.config)
-        self.ws_client = ws_client or SwitchWebSocketClient(self.config)
-        self.sse_client = (
-            sse_client  # Maintained for backwards-compatible test fixtures
-        )
-
-        self.is_running = False
-        self.is_connected = False
-        self.current_cursor: int | None = None
-        self.connection_generation: int | None = None
-        self.active_rooms: list[str] = []
-        self.last_heartbeat_time: float = 0.0
-
-    @property
-    def _current_cursor(self) -> int | None:
-        """Backwards compatibility alias for cursor position."""
-        return self.current_cursor
-
-    @_current_cursor.setter
-    def _current_cursor(self, val: int | None) -> None:
-        self.current_cursor = val
 
     # -----------------------------------------------------------------------
     # Advisory Forecast Response Synthesis
@@ -152,6 +133,53 @@ class ForecastSwitchAdapter:
             )
         return msg + ADVISORY_FOOTER
 
+    def format_incident_alert_reply(
+        self, incident_id: str | None = None, temp_c: float = 82.5
+    ) -> str:
+        """Format and record a simulated thermal anomaly alert for multi-agent negotiation."""
+        inc_id = incident_id or f"inc-{datetime.now(timezone.utc).strftime('%H%M%S')}"
+        self.simulator.trigger_anomaly(target_ambient_c=34.0)
+        if self.simulator.core_temp_c < temp_c:
+            self.simulator._core_temp_c = temp_c
+        telemetry = self.simulator.step()
+        forecast = self.forecast_agent.observe(telemetry)
+
+        alert_payload = ThermalAlertPayload(
+            incident_id=inc_id,
+            gpu_id=forecast.gpu_id,
+            current_temp_c=forecast.current_temp_c or temp_c,
+            critical_threshold_c=forecast.critical_threshold_c,
+            time_to_threshold_s=(
+                forecast.time_to_threshold_s
+                if forecast.time_to_threshold_s is not None
+                else 22.5
+            ),
+            rate_c_per_s=(
+                forecast.rate_c_per_s if forecast.rate_c_per_s is not None else 0.320
+            ),
+            acceleration_c_per_s2=forecast.acceleration_c_per_s2,
+            risk_status="CRITICAL_RISK",
+            reason=(
+                f"Simulated intake heating anomaly caused rapid thermal runaway to {temp_c:.1f}°C; "
+                f"trajectory will breach {forecast.critical_threshold_c:.1f}°C hardware trip limit "
+                f"within 25s without coordinated mitigation."
+            ),
+        )
+        return format_discord_message(alert_payload)
+
+    async def trigger_simulated_incident(
+        self,
+        room_id: str,
+        incident_id: str | None = None,
+        temp_c: float = 82.5,
+    ) -> str:
+        """Deterministically trigger and broadcast a simulated thermal incident to the room."""
+        content = self.format_incident_alert_reply(
+            incident_id=incident_id, temp_c=temp_c
+        )
+        await self.http_client.send_message(room_id=room_id, content=content)
+        return content
+
     @staticmethod
     def format_help_reply() -> str:
         """Format supported advisory queries."""
@@ -163,6 +191,7 @@ class ForecastSwitchAdapter:
             "• `@ForecastAgent status` — Current temperature, power, and thermal risk level.",
             "• `@ForecastAgent forecast` — Polynomial derivative rates and predictive runaway trajectory.",
             "• `@ForecastAgent time-to-trip` (or `ttt`) — Countdown seconds to 85.0°C hardware throttle.",
+            "• `@ForecastAgent incident` (or `simulate-incident`) — Trigger simulated thermal incident for multi-agent negotiation.",
             "• `@ForecastAgent help` — Display this command reference.",
             "",
             (
@@ -192,6 +221,18 @@ class ForecastSwitchAdapter:
                 "verification and authenticated operator sign-off at the governance desk."
                 + ADVISORY_FOOTER
             )
+
+        if any(
+            k in clean_text
+            for k in (
+                "incident",
+                "simulate-incident",
+                "trigger-incident",
+                "anomaly",
+                "runaway",
+            )
+        ):
+            return self.format_incident_alert_reply()
 
         if any(k in clean_text for k in ("help", "commands", "usage")):
             return self.format_help_reply()
@@ -278,144 +319,3 @@ class ForecastSwitchAdapter:
         except Exception as exc:
             logger.error("Failed to dispatch reply to room %s: %s", room_id, exc)
             raise
-
-    # -----------------------------------------------------------------------
-    # Connection Lifecycle & Reconnect Handling
-    # -----------------------------------------------------------------------
-
-    async def start(self) -> None:
-        """Start the adapter, open the WebSocket event stream, and process events."""
-        self.is_running = True
-        reconnect_delay = self.config.reconnect_delay_s
-
-        # Resolve declared rooms to claim on connect
-        declared_rooms: list[str] = sorted(self.config.authorized_room_ids)
-        if not declared_rooms:
-            try:
-                assigned_rooms = await self.http_client.list_assigned_rooms()
-                declared_rooms = [
-                    r["room_id"]
-                    for r in assigned_rooms
-                    if isinstance(r, dict) and "room_id" in r
-                ]
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Could not pre-fetch assigned rooms: %s", exc)
-
-        logger.info(
-            "Connecting ForecastSwitchAdapter via WebSocket (agent_id: %s, connection_id: %s, rooms: %s)",
-            self.config.agent_id,
-            self.config.connection_id,
-            declared_rooms,
-        )
-
-        while self.is_running:
-            start_from = (
-                str(self.current_cursor) if self.current_cursor is not None else "head"
-            )
-            try:
-                # If sse_client was provided explicitly for legacy test fixtures, use it;
-                # otherwise use current WebSocket transport.
-                if (
-                    self.sse_client is not None
-                    and self.ws_client._custom_stream_factory is None
-                ):
-                    stream = self.sse_client.connect_events(
-                        connection_id=self.config.connection_id,
-                        start_from=start_from,
-                    )
-                else:
-                    stream = self.ws_client.connect_events(
-                        start_from=start_from,
-                        rooms=declared_rooms if declared_rooms else None,
-                    )
-
-                async for frame in stream:
-                    if not self.is_running:
-                        break
-
-                    self.is_connected = True
-                    reconnect_delay = self.config.reconnect_delay_s
-
-                    event = frame.get("event")
-                    seq = frame.get("id")
-                    if seq is not None and str(seq).isdigit():
-                        self.current_cursor = int(seq)
-
-                    if event == "connection_state":
-                        st = frame.get("data", {})
-                        if isinstance(st, dict):
-                            self.connection_generation = st.get("generation")
-                            self.active_rooms = list(st.get("rooms", []))
-                            if st.get("cursor") is not None:
-                                self.current_cursor = int(st["cursor"])
-                        logger.info(
-                            "Switch WebSocket connection active (generation: %s, rooms: %s, cursor: %s)",
-                            self.connection_generation,
-                            self.active_rooms,
-                            self.current_cursor,
-                        )
-
-                    elif event == "ping":
-                        self.last_heartbeat_time = asyncio.get_running_loop().time()
-                        logger.debug(
-                            "Switch ping acknowledged (pong sent, cursor: %s)",
-                            self.current_cursor,
-                        )
-
-                    elif event == "message":
-                        data = frame.get("data")
-                        if isinstance(data, dict):
-                            await self.handle_message_event(data)
-
-            except asyncio.CancelledError:
-                break
-            except SwitchAuthError as exc:
-                logger.error(
-                    "Non-recoverable authentication failure from Switch bridge: %s", exc
-                )
-                self.is_running = False
-                self.is_connected = False
-                break
-            except SwitchEvictedError as exc:
-                if exc.code == "taken_over":
-                    logger.warning(
-                        "Connection superseded/taken over by another instance: %s", exc
-                    )
-                    self.is_running = False
-                    self.is_connected = False
-                    break
-                logger.warning(
-                    "Connection evicted (%s). Reconnecting in %.1fs...",
-                    exc,
-                    reconnect_delay,
-                )
-                self.is_connected = False
-                if not self.is_running:
-                    break
-                await asyncio.sleep(reconnect_delay)
-                reconnect_delay = min(
-                    reconnect_delay * 1.5, self.config.max_reconnect_delay_s
-                )
-            except Exception as exc:  # noqa: BLE001 - resilience against network drops
-                self.is_connected = False
-                if not self.is_running:
-                    break
-                logger.warning(
-                    "Switch WebSocket disconnected (%s). Reconnecting in %.1fs (cursor: %s)...",
-                    exc,
-                    reconnect_delay,
-                    self.current_cursor,
-                )
-                await asyncio.sleep(reconnect_delay)
-                reconnect_delay = min(
-                    reconnect_delay * 1.5, self.config.max_reconnect_delay_s
-                )
-
-        await self.stop()
-
-    async def stop(self) -> None:
-        """Gracefully stop adapter and close WebSocket connection."""
-        self.is_running = False
-        self.is_connected = False
-        await self.ws_client.close()
-        logger.info("ForecastSwitchAdapter stopped cleanly")

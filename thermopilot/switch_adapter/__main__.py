@@ -1,7 +1,8 @@
-"""Executable entrypoint for running the ThermoPilot Switch Agent Adapter."""
+"""Executable entrypoint for running the ThermoPilot Switch Agent Adapters."""
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import logging
 import signal
@@ -9,6 +10,7 @@ import sys
 
 from thermopilot.switch_adapter.adapter import ForecastSwitchAdapter
 from thermopilot.switch_adapter.config import SwitchAdapterConfig
+from thermopilot.switch_adapter.runner import MultiAgentSwitchRunner
 
 
 def setup_logging() -> None:
@@ -23,19 +25,26 @@ async def main() -> None:
     setup_logging()
     logger = logging.getLogger("thermopilot.switch_adapter")
 
-    try:
-        config = SwitchAdapterConfig.from_env()
-    except (ValueError, KeyError, OSError) as exc:
-        logger.error("Configuration error: %s", exc)
-        sys.exit(1)
-
-    adapter = ForecastSwitchAdapter(config=config)
+    parser = argparse.ArgumentParser(
+        description="Run ThermoPilot Switch Agent Adapter(s)"
+    )
+    parser.add_argument(
+        "--single",
+        action="store_true",
+        help="Run only forecast-agent instead of all 3 multi-agent adapters",
+    )
+    parser.add_argument(
+        "--env-file",
+        default=".env",
+        help="Path to environment file (default: .env)",
+    )
+    args = parser.parse_args()
 
     loop = asyncio.get_running_loop()
     stop_event = asyncio.Event()
 
     def _signal_handler() -> None:
-        logger.info("Shutdown signal received. Stopping adapter...")
+        logger.info("Shutdown signal received. Stopping...")
         stop_event.set()
 
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -44,15 +53,30 @@ async def main() -> None:
         except (NotImplementedError, RuntimeError):
             pass
 
-    adapter_task = asyncio.create_task(adapter.start())
+    if args.single:
+        try:
+            config = SwitchAdapterConfig.from_env(env_file=args.env_file)
+        except (ValueError, KeyError, OSError) as exc:
+            logger.error("Configuration error: %s", exc)
+            sys.exit(1)
+
+        runner = ForecastSwitchAdapter(config=config)
+    else:
+        try:
+            runner = MultiAgentSwitchRunner.from_env(env_file=args.env_file)
+        except (ValueError, KeyError, OSError) as exc:
+            logger.error("Multi-agent configuration error: %s", exc)
+            sys.exit(1)
+
+    runner_task = asyncio.create_task(runner.start())
 
     try:
         await stop_event.wait()
     finally:
-        await adapter.stop()
-        adapter_task.cancel()
+        await runner.stop()
+        runner_task.cancel()
         try:
-            await adapter_task
+            await runner_task
         except asyncio.CancelledError:
             pass
 
