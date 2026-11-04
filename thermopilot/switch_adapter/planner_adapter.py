@@ -17,6 +17,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
+from thermopilot.executor.executor import SimulationExecutor
 from thermopilot.hitl.switch import SwitchApprovalDesk
 from thermopilot.planner.planner import RecoveryPlanner
 from thermopilot.schemas import (
@@ -25,6 +26,7 @@ from thermopilot.schemas import (
     GPUTelemetry,
     WorkloadSpec,
 )
+from thermopilot.simulator.telemetry import TelemetrySimulator
 from thermopilot.switch_adapter.base import BaseSwitchAdapter
 from thermopilot.switch_adapter.client import (
     SwitchHttpClient,
@@ -35,6 +37,7 @@ from thermopilot.switch_adapter.messages import (
     ADVISORY_FOOTER,
     DecisionCardItem,
     DecisionCardPayload,
+    ExecutionResultPayload,
     NegotiationCompletePayload,
     RecoveryCandidateItem,
     RecoveryProposalPayload,
@@ -57,6 +60,8 @@ class PlannerSwitchAdapter(BaseSwitchAdapter):
         config: SwitchAdapterConfig,
         planner: RecoveryPlanner | None = None,
         desk: SwitchApprovalDesk | None = None,
+        executor: SimulationExecutor | None = None,
+        simulator: TelemetrySimulator | None = None,
         http_client: SwitchHttpClient | None = None,
         ws_client: SwitchWebSocketClient | None = None,
     ) -> None:
@@ -66,6 +71,8 @@ class PlannerSwitchAdapter(BaseSwitchAdapter):
             safety_gate=self.planner.safety_gate,
             default_timeout_s=self.config.approval_timeout_s,
         )
+        self.executor = executor or SimulationExecutor()
+        self.simulator = simulator or TelemetrySimulator()
         self.processed_incidents: set[str] = set()
         self.active_incidents: dict[str, dict[str, Any]] = {}
         self.finalized_incidents: set[str] = set()
@@ -179,7 +186,7 @@ class PlannerSwitchAdapter(BaseSwitchAdapter):
         plan_id: str | None,
         operator_id: str,
         incident_context: dict[str, Any],
-    ) -> str:
+    ) -> list[str] | str:
         """Handle validated operator approval or rejection command."""
         # 1. Timeout escalation check
         timeout_s = self.config.approval_timeout_s
@@ -267,13 +274,37 @@ class PlannerSwitchAdapter(BaseSwitchAdapter):
         self.finalized_incidents.add(incident_id)
         self.active_incidents.pop(incident_id, None)
 
-        reply = (
+        msg_auth = (
             f"✅ **Plan `{plan_id}` Approved and Pre-Execution Certified by SafetyGate.** "
             f"Operator: `{operator_id}` | Incident: `{incident_id}`."
             + ADVISORY_FOOTER
         )
-        await self.http_client.send_message(room_id=room_id, content=reply)
-        return reply
+        await self.http_client.send_message(room_id=room_id, content=msg_auth)
+
+        # 4. Simulation Execution
+        exec_res = self.executor.execute_workflow_result(
+            workflow_result=wf_result,
+            simulator=self.simulator,
+            workloads=incident_context["workloads"],
+        )
+
+        exec_payload = ExecutionResultPayload(
+            incident_id=incident_id,
+            execution_id=exec_res.execution_id,
+            plan_id=plan_id or "PLAN-B",
+            operator_id=operator_id,
+            success=exec_res.success,
+            applied_actions=[a.model_dump(mode="json") for a in exec_res.applied_actions],
+            node_power_w=float(exec_res.details.get("total_node_power_w", 330.0)),
+            revalidation_passed=True,
+            is_simulated=True,
+        )
+
+        await asyncio.sleep(0.3)
+        msg_exec = format_discord_message(exec_payload)
+        await self.http_client.send_message(room_id=room_id, content=msg_exec)
+
+        return [msg_auth, msg_exec]
 
     def plan_and_certify(
         self, bid_payload: WorkloadBidPayload, room_id: str = ""

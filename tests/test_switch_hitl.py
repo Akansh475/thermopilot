@@ -10,8 +10,10 @@ from thermopilot.schemas import NodeConstraints
 from thermopilot.switch_adapter.client import SwitchHttpClient
 from thermopilot.switch_adapter.config import SwitchAdapterConfig
 from thermopilot.switch_adapter.messages import (
+    ExecutionResultPayload,
     WorkloadBidItem,
     WorkloadBidPayload,
+    parse_switch_message,
 )
 from thermopilot.switch_adapter.planner_adapter import PlannerSwitchAdapter
 
@@ -251,8 +253,10 @@ class TestSwitchOperatorAuthorization(unittest.IsolatedAsyncioTestCase):
         }
         reply = await self.adapter.handle_message_event(event)
         self.assertIsNotNone(reply)
-        self.assertIn("Plan `PLAN-B` Approved and Pre-Execution Certified by SafetyGate", reply)
-        self.assertIn("operator-alice", reply)
+        combined = "\n".join(reply) if isinstance(reply, list) else str(reply)
+        self.assertIn("Plan `PLAN-B` Approved and Pre-Execution Certified by SafetyGate", combined)
+        self.assertIn("operator-alice", combined)
+        self.assertIn("execution_result", combined)
 
     async def test_non_approval_mutation_commands_rejected_for_everyone(self) -> None:
         """Raw execution or mitigation commands in chat are blocked even for authorized operators."""
@@ -357,7 +361,9 @@ class TestSwitchTimeoutAndDuplicate(unittest.IsolatedAsyncioTestCase):
         }
         # First approval
         reply1 = await self.adapter.handle_message_event(event)
-        self.assertIn("Approved", reply1)
+        combined1 = "\n".join(reply1) if isinstance(reply1, list) else str(reply1)
+        self.assertIn("Approved", combined1)
+        self.assertIn("execution_result", combined1)
 
         # Second approval attempt (duplicate replay)
         reply2 = await self.adapter.handle_message_event(event)
@@ -481,6 +487,83 @@ class TestSwitchPreExecutionSafetyGate(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(reply)
         self.assertIn("Execution Denied by SafetyGate", reply)
         self.assertIn("Pre-execution Safety Gate revalidation failed", reply)
+
+
+class TestSwitchSimulationExecutor(unittest.IsolatedAsyncioTestCase):
+    """Test suite verifying SimulationExecutor integration on plan approval."""
+
+    def setUp(self) -> None:
+        self.room_id = "test-room-executor"
+        self.config = SwitchAdapterConfig(
+            agent_id="test-planner-id",
+            api_key="test-planner-key",
+            client_name="planner-agent",
+            allowed_rooms=frozenset({self.room_id}),
+            authorized_operators=frozenset({"operator-alice"}),
+            approval_timeout_s=30.0,
+        )
+        self.mock_http = AsyncMock(spec=SwitchHttpClient)
+        self.adapter = PlannerSwitchAdapter(self.config, http_client=self.mock_http)
+
+        bids = WorkloadBidPayload(
+            incident_id="inc-exec-test",
+            proposals=[
+                WorkloadBidItem(
+                    workload_id="wl-alpha-inference",
+                    name="Financial Trading Batch",
+                    priority="P0_CRITICAL",
+                    current_power_w=250.0,
+                    min_power_w=200.0,
+                    requested_power_w=220.0,
+                    can_preempt=False,
+                    sla_importance_score=0.98,
+                    rationale="VIP non-preemptible",
+                    estimated_trade_off="None",
+                ),
+                WorkloadBidItem(
+                    workload_id="wl-beta-training",
+                    name="Diffusion Fine-Tuning",
+                    priority="P2_FLEXIBLE",
+                    current_power_w=150.0,
+                    min_power_w=150.0,
+                    requested_power_w=160.0,
+                    can_preempt=True,
+                    sla_importance_score=0.15,
+                    rationale="Elastic batch training",
+                    estimated_trade_off="Can cap or pause",
+                ),
+            ],
+        )
+        self.adapter.plan_and_certify(bids, room_id=self.room_id)
+
+    async def test_simulation_executor_applied_and_dispatched_on_approval(self) -> None:
+        """Approving certified plan triggers SimulationExecutor and emits execution card."""
+        event = {
+            "type": "message",
+            "room_id": self.room_id,
+            "payload": {
+                "sender_name": "operator-alice",
+                "addressed": True,
+                "body": "@planner-agent approve inc-exec-test PLAN-B",
+            },
+        }
+        res = await self.adapter.handle_message_event(event)
+        self.assertIsInstance(res, list)
+        self.assertEqual(len(res), 2)
+
+        # First message: operator authorization confirmation
+        self.assertIn("Approved and Pre-Execution Certified", res[0])
+
+        # Second message: ExecutionResultPayload
+        msg_exec = parse_switch_message(res[1])
+        self.assertIsInstance(msg_exec, ExecutionResultPayload)
+        self.assertEqual(msg_exec.incident_id, "inc-exec-test")
+        self.assertEqual(msg_exec.plan_id, "PLAN-B")
+        self.assertEqual(msg_exec.operator_id, "operator-alice")
+        self.assertTrue(msg_exec.revalidation_passed)
+        self.assertTrue(msg_exec.is_simulated)
+        self.assertGreater(msg_exec.node_power_w, 0.0)
+
 
 
 
