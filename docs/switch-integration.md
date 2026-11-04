@@ -18,12 +18,12 @@ The **ThermoPilot Switch Adapter** (`thermopilot.switch_adapter`) connects the e
    │                    Agent Switch                         │
    └───────────────────────────▲─────────────────────────────┘
                                │  Switch Agent Protocol
-                               │  (Outbound HTTP / Inbound SSE)
+                               │  (Outbound HTTP Message / Inbound WebSocket Stream)
                                ▼
 ┌──────────────────────────────────────────────────────────────────────────┐
 │             ThermoPilot Switch Agent Adapter (Async Client)              │
-│  - Persistent connection_id generation & heartbeat (every 2.0s)          │
-│  - SSE event stream listener (GET /agents/{id}/events)                   │
+│  - Persistent WebSocket connection (/agents/{id}/connection/ws)          │
+│  - Duplex ping/pong heartbeat handling & cursor tracking                 │
 │  - Addressed-message filter & room authorization checker                 │
 │  - Direct chat reply dispatcher (POST /agents/{id}/message)              │
 └──────────────────────────────┬───────────────────────────────────────────┘
@@ -42,9 +42,9 @@ The **ThermoPilot Switch Adapter** (`thermopilot.switch_adapter`) connects the e
 
 ## 2. Official Wire Protocol Summary
 
-* **Downstream Delivery:** One Server-Sent Events (SSE) stream (`GET /agents/{id}/events?connection_id=...&scope=all&filter=all`).
-* **Upstream Operations:** Standard HTTP POST requests (`POST /agents/{id}/message`, `POST /agents/{id}/connection/beat`).
-* **Client Heartbeat:** Sent every **2.0 seconds** to maintain connection liveness (Switch TTL is 6.0 seconds).
+* **Downstream Delivery:** Persistent duplex WebSocket connection (`ws://<host>:<port>/agents/{id}/connection/ws?connection_id=...&scope=all&filter=all`).
+* **Heartbeat & Liveness:** Handled in-band via WebSocket application `ping` frames from Switch Core and `pong` replies from the adapter containing the current event cursor (`{"type": "pong", "cursor": n}`).
+* **Upstream Operations:** Standard HTTP POST requests (`POST /agents/{id}/message`).
 * **Network Simplicity:** ThermoPilot runs as an **outbound client**. No open incoming ports, public webhooks, or ngrok tunnels are required.
 
 ---
@@ -118,15 +118,15 @@ python -m thermopilot.switch_adapter
 
 **Expected Startup Output:**
 ```text
-2026-11-01 14:30:00 [INFO] thermopilot.switch_adapter: Connecting ForecastSwitchAdapter (agent_id: ..., connection_id: ...)
-2026-11-01 14:30:00 [INFO] thermopilot.switch_adapter.adapter: Starting Switch heartbeat worker (interval: 2.0s)
+2026-11-04 14:30:00 [INFO] thermopilot.switch_adapter.adapter: Connecting ForecastSwitchAdapter via WebSocket (agent_id: ..., connection_id: ...)
+2026-11-04 14:30:00 [INFO] thermopilot.switch_adapter.adapter: Switch WebSocket connection active (generation: ..., rooms: [...], cursor: 0)
 ```
 
 ### Stopping the Adapter
-Send a standard interrupt (`Ctrl+C` / `SIGINT` or `SIGTERM`). The adapter cleanly terminates the heartbeat task and closes the SSE stream connection:
+Send a standard interrupt (`Ctrl+C` / `SIGINT` or `SIGTERM`). The adapter cleanly closes the WebSocket connection and shuts down:
 ```text
-2026-11-01 14:31:00 [INFO] thermopilot.switch_adapter: Shutdown signal received. Stopping adapter...
-2026-11-01 14:31:00 [INFO] thermopilot.switch_adapter.adapter: ForecastSwitchAdapter stopped cleanly
+2026-11-04 14:31:00 [INFO] thermopilot.switch_adapter: Shutdown signal received. Stopping adapter...
+2026-11-04 14:31:00 [INFO] thermopilot.switch_adapter.adapter: ForecastSwitchAdapter stopped cleanly
 ```
 
 ---

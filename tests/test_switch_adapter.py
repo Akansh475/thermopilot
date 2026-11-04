@@ -1,18 +1,19 @@
 """Comprehensive unit tests for the ThermoPilot Switch Agent Adapter.
 
 Verifies:
-1. SwitchAdapterConfig validation, environment parsing, and credential masking.
+1. SwitchAdapterConfig validation, environment parsing, credential masking, and WebSocket URL building.
 2. SwitchHttpClient REST request building, authorization, and error handling.
-3. SwitchSSEClient line parsing, event dispatching, and stream error handling.
-4. ForecastSwitchAdapter message filtering (addressed vs unaddressed, authorized vs unauthorized rooms).
-5. Advisory query routing (status, forecast, time-to-trip, help, execution denial).
-6. Background heartbeat scheduling and lifecycle shutdown.
-7. Reconnection handling on simulated network disconnections.
+3. SwitchWebSocketClient frame parsing, automated pong heartbeat responses, cursor tracking, and error mapping.
+4. Legacy SwitchSSEClient backward compatibility.
+5. ForecastSwitchAdapter message filtering (addressed vs unaddressed, authorized vs unauthorized rooms).
+6. Advisory query routing (status, forecast, time-to-trip, help, execution denial).
+7. WebSocket streaming lifecycle, clean stop, and ping/pong processing.
+8. Reconnection handling and cursor resumption on socket disconnections.
+9. Fatal error termination (auth failure, taken_over eviction).
 """
 
 from __future__ import annotations
 
-import asyncio
 import unittest
 import uuid
 from collections.abc import AsyncGenerator
@@ -22,7 +23,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from thermopilot.agents.forecast import ForecastAgent, ForecastConfig
 from thermopilot.simulator.telemetry import SimulatorConfig, TelemetrySimulator
 from thermopilot.switch_adapter.adapter import ForecastSwitchAdapter
-from thermopilot.switch_adapter.client import SwitchHttpClient, SwitchSSEClient
+from thermopilot.switch_adapter.client import (
+    SwitchAuthError,
+    SwitchConflictError,
+    SwitchEvictedError,
+    SwitchHttpClient,
+    SwitchSSEClient,
+    SwitchWebSocketClient,
+)
 from thermopilot.switch_adapter.config import SwitchAdapterConfig
 
 
@@ -68,6 +76,25 @@ class TestSwitchAdapterConfig(unittest.TestCase):
         self.assertTrue(cfg.is_room_authorized("room-102"))
         self.assertFalse(cfg.is_room_authorized("room-999"))
 
+    def test_build_ws_url(self) -> None:
+        cfg = SwitchAdapterConfig(
+            bridge_url="http://127.0.0.1:60824",
+            agent_id="agent-1234",
+            api_key="secret",
+            connection_id="11111111-1111-1111-1111-111111111111",
+            scope="all",
+            event_filter="addressed",
+        )
+        url = cfg.build_ws_url(start_from="42", rooms=["room-a", "room-b"])
+        self.assertTrue(
+            url.startswith("ws://127.0.0.1:60824/agents/agent-1234/connection/ws?")
+        )
+        self.assertIn("connection_id=11111111-1111-1111-1111-111111111111", url)
+        self.assertIn("scope=all", url)
+        self.assertIn("filter=addressed", url)
+        self.assertIn("start_from=42", url)
+        self.assertIn("rooms=room-a%2Croom-b", url)
+
     def test_from_env(self) -> None:
         with patch.dict(
             "os.environ",
@@ -79,7 +106,7 @@ class TestSwitchAdapterConfig(unittest.TestCase):
                 "SWITCH_HEARTBEAT_INTERVAL_S": "1.5",
             },
         ):
-            cfg = SwitchAdapterConfig.from_env(connection_id_file=None)
+            cfg = SwitchAdapterConfig.from_env(env_file=None, connection_id_file=None)
             self.assertEqual(cfg.bridge_url, "http://127.0.0.1:9000")
             self.assertEqual(cfg.agent_id, "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
             self.assertEqual(cfg.api_key, "sw_ak_envsecret9999")
@@ -115,7 +142,9 @@ class TestSwitchHttpClient(unittest.IsolatedAsyncioTestCase):
         mock_executor = MagicMock(return_value={"ok": True, "event_id": "$event123"})
         client = SwitchHttpClient(self.config, request_executor=mock_executor)
 
-        res = await client.send_message(room_id="room-42", content="Hello from ThermoPilot")
+        res = await client.send_message(
+            room_id="room-42", content="Hello from ThermoPilot"
+        )
         self.assertEqual(res["event_id"], "$event123")
         mock_executor.assert_called_once_with(
             "POST",
@@ -145,9 +174,132 @@ class TestSwitchHttpClient(unittest.IsolatedAsyncioTestCase):
             {"X-Switch-Connection-Id": self.config.connection_id},
         )
 
+    async def test_list_assigned_rooms(self) -> None:
+        mock_executor = MagicMock(
+            return_value={
+                "result": [
+                    {"room_id": "room-1", "name": "General"},
+                    {"room_id": "room-2", "name": "Alerts"},
+                ]
+            }
+        )
+        client = SwitchHttpClient(self.config, request_executor=mock_executor)
+
+        rooms = await client.list_assigned_rooms()
+        self.assertEqual(len(rooms), 2)
+        self.assertEqual(rooms[0]["room_id"], "room-1")
+        mock_executor.assert_called_once_with(
+            "POST",
+            f"/agents/{self.config.agent_id}/ops/list_rooms",
+            {},
+            None,
+        )
+
+    async def test_list_rooms_moderation(self) -> None:
+        mock_executor = MagicMock(
+            return_value={"rooms": [{"id": "r-mod-1", "name": "All Rooms"}]}
+        )
+        client = SwitchHttpClient(self.config, request_executor=mock_executor)
+
+        rooms = await client.list_rooms()
+        self.assertEqual(len(rooms), 1)
+        self.assertEqual(rooms[0]["id"], "r-mod-1")
+        mock_executor.assert_called_once_with(
+            "GET",
+            f"/agents/{self.config.agent_id}/moderation/rooms",
+            None,
+            None,
+        )
+
+
+class TestSwitchWebSocketClient(unittest.IsolatedAsyncioTestCase):
+    """Test SwitchWebSocketClient streaming, pong answering, cursor tracking, and error mapping."""
+
+    def setUp(self) -> None:
+        self.config = SwitchAdapterConfig(
+            bridge_url="http://localhost:8000",
+            agent_id="test-agent",
+            api_key="secret",
+            connection_id=str(uuid.uuid4()),
+        )
+
+    async def test_custom_stream_factory_cursor_and_state(self) -> None:
+        sample_frames = [
+            {
+                "event": "connection_state",
+                "id": None,
+                "data": {
+                    "connection_id": self.config.connection_id,
+                    "generation": 100,
+                    "rooms": ["room-main"],
+                    "cursor": 5,
+                },
+            },
+            {
+                "event": "message",
+                "id": 6,
+                "data": {
+                    "type": "message",
+                    "room_id": "room-main",
+                    "payload": {"body": "hi"},
+                },
+            },
+        ]
+
+        async def mock_stream() -> AsyncGenerator[dict[str, Any], None]:
+            for frame in sample_frames:
+                yield frame
+
+        client = SwitchWebSocketClient(self.config, stream_factory=mock_stream)
+        collected = []
+        async for frame in client.connect_events(start_from="head"):
+            collected.append(frame)
+
+        self.assertEqual(len(collected), 2)
+        self.assertEqual(client.generation, 100)
+        self.assertEqual(client.rooms, ["room-main"])
+        self.assertEqual(client.cursor, 6)
+
+    async def test_refused_frame_raises_auth_error(self) -> None:
+        async def mock_refused_stream() -> AsyncGenerator[dict[str, Any], None]:
+            yield {
+                "event": "refused",
+                "data": {"status": 401, "detail": "Invalid token"},
+            }
+
+        client = SwitchWebSocketClient(self.config, stream_factory=mock_refused_stream)
+        with self.assertRaises(SwitchAuthError):
+            async for _ in client.connect_events():
+                pass
+
+    async def test_refused_frame_raises_conflict_error(self) -> None:
+        async def mock_conflict_stream() -> AsyncGenerator[dict[str, Any], None]:
+            yield {
+                "event": "refused",
+                "data": {"status": 409, "detail": "Superseded"},
+            }
+
+        client = SwitchWebSocketClient(self.config, stream_factory=mock_conflict_stream)
+        with self.assertRaises(SwitchConflictError):
+            async for _ in client.connect_events():
+                pass
+
+    async def test_evicted_frame_raises_evicted_error(self) -> None:
+        async def mock_evicted_stream() -> AsyncGenerator[dict[str, Any], None]:
+            yield {
+                "event": "evicted",
+                "data": {"code": "taken_over", "reason": "Another socket opened"},
+            }
+
+        client = SwitchWebSocketClient(self.config, stream_factory=mock_evicted_stream)
+        with self.assertRaises(SwitchEvictedError) as ctx:
+            async for _ in client.connect_events():
+                pass
+        self.assertEqual(ctx.exception.code, "taken_over")
+
 
 class TestSwitchSSEClient(unittest.IsolatedAsyncioTestCase):
-    """Test SSE parsing, comment filtering, and structured frame delivery."""
+    """Test legacy SSE parsing and backwards compatibility."""
 
     async def test_custom_stream_factory(self) -> None:
         config = SwitchAdapterConfig(
@@ -158,8 +310,16 @@ class TestSwitchSSEClient(unittest.IsolatedAsyncioTestCase):
         )
 
         sample_frames = [
-            {"event": "connection_state", "id": None, "data": {"connection_id": config.connection_id}},
-            {"event": "message", "id": "1", "data": {"type": "message", "payload": {"body": "hi"}}},
+            {
+                "event": "connection_state",
+                "id": None,
+                "data": {"connection_id": config.connection_id},
+            },
+            {
+                "event": "message",
+                "id": "1",
+                "data": {"type": "message", "payload": {"body": "hi"}},
+            },
         ]
 
         async def mock_stream() -> AsyncGenerator[dict[str, Any], None]:
@@ -187,7 +347,6 @@ class TestForecastSwitchAdapter(unittest.IsolatedAsyncioTestCase):
             connection_id=str(uuid.uuid4()),
             authorized_room_ids=frozenset(["room-discord-main"]),
         )
-        # Controlled simulator starting nominal at 72.0C
         self.sim = TelemetrySimulator(
             SimulatorConfig(
                 power_budget_w=400.0,
@@ -199,7 +358,9 @@ class TestForecastSwitchAdapter(unittest.IsolatedAsyncioTestCase):
         )
         self.forecast_agent = ForecastAgent(ForecastConfig())
         self.mock_http = MagicMock()
-        self.mock_http.send_message = AsyncMock(return_value={"ok": True, "event_id": "$mock1"})
+        self.mock_http.send_message = AsyncMock(
+            return_value={"ok": True, "event_id": "$mock1"}
+        )
         self.mock_http.send_heartbeat = AsyncMock(return_value={"ok": True})
 
         self.adapter = ForecastSwitchAdapter(
@@ -335,33 +496,25 @@ class TestForecastSwitchAdapter(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(reply)
         self.assertIn("Execution Denied", reply)
         self.assertIn("SafetyGate", reply)
-        # Ensure simulator was not modified
         self.assertEqual(self.sim.core_temp_c, 72.0)
 
-    async def test_heartbeat_worker_lifecycle(self) -> None:
-        """Heartbeat worker runs and cancels cleanly on stop."""
-        self.adapter.is_running = True
-        task = asyncio.create_task(self.adapter._heartbeat_worker())
-        await asyncio.sleep(0.05)
-        await self.adapter.stop()
-        await task
-        self.assertFalse(self.adapter.is_running)
-        self.mock_http.send_heartbeat.assert_called()
-
-    async def test_reconnect_loop_resilience(self) -> None:
-        """Adapter handles stream disconnect and reconnects without crashing."""
-        call_count = 0
-
-        async def flaky_stream() -> AsyncGenerator[dict[str, Any], None]:
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                # First connection drops immediately
-                raise ConnectionResetError("Simulated socket drop")
-            # Second connection yields one event then finishes
-            yield {
+    async def test_websocket_streaming_lifecycle(self) -> None:
+        """Adapter processes WebSocket stream frames including connection_state and ping."""
+        frames = [
+            {
+                "event": "connection_state",
+                "id": None,
+                "data": {
+                    "connection_id": self.config.connection_id,
+                    "generation": 12345,
+                    "rooms": ["room-discord-main"],
+                    "cursor": 10,
+                },
+            },
+            {"event": "ping", "id": None, "data": {}},
+            {
                 "event": "message",
-                "id": "1",
+                "id": 11,
                 "data": {
                     "type": "message",
                     "room_id": "room-discord-main",
@@ -371,11 +524,76 @@ class TestForecastSwitchAdapter(unittest.IsolatedAsyncioTestCase):
                         "body": "@ForecastAgent status",
                     },
                 },
-            }
-            # Terminate test
+            },
+        ]
+
+        async def stream_factory() -> AsyncGenerator[dict[str, Any], None]:
+            for f in frames:
+                yield f
             self.adapter.is_running = False
 
-        self.adapter.sse_client = SwitchSSEClient(self.config, stream_factory=flaky_stream)
+        self.adapter.ws_client = SwitchWebSocketClient(
+            self.config, stream_factory=stream_factory
+        )
+        await self.adapter.start()
+
+        self.assertEqual(self.adapter.connection_generation, 12345)
+        self.assertEqual(self.adapter.active_rooms, ["room-discord-main"])
+        self.assertEqual(self.adapter.current_cursor, 11)
+        self.assertGreater(self.adapter.last_heartbeat_time, 0.0)
+        self.mock_http.send_message.assert_called_once()
+
+    async def test_reconnect_loop_resilience_and_cursor_resumption(self) -> None:
+        """Adapter handles socket drop and reconnects with cursor position."""
+        call_count = 0
+        requested_start_from: list[str] = []
+
+        async def flaky_stream() -> AsyncGenerator[dict[str, Any], None]:
+            nonlocal call_count
+            call_count += 1
+            start_from = (
+                str(self.adapter.current_cursor)
+                if self.adapter.current_cursor is not None
+                else "head"
+            )
+            requested_start_from.append(start_from)
+
+            if call_count == 1:
+                # First connection delivers frame 1 then disconnects
+                yield {
+                    "event": "message",
+                    "id": 1,
+                    "data": {
+                        "type": "message",
+                        "room_id": "room-discord-main",
+                        "payload": {
+                            "addressed": True,
+                            "sender_name": "operator",
+                            "body": "@ForecastAgent status",
+                        },
+                    },
+                }
+                raise ConnectionResetError("Simulated socket drop")
+
+            # Second connection yields frame 2 and terminates
+            yield {
+                "event": "message",
+                "id": 2,
+                "data": {
+                    "type": "message",
+                    "room_id": "room-discord-main",
+                    "payload": {
+                        "addressed": True,
+                        "sender_name": "operator",
+                        "body": "@ForecastAgent ttt",
+                    },
+                },
+            }
+            self.adapter.is_running = False
+
+        self.adapter.ws_client = SwitchWebSocketClient(
+            self.config, stream_factory=flaky_stream
+        )
         self.adapter.config = SwitchAdapterConfig(
             bridge_url=self.config.bridge_url,
             agent_id=self.config.agent_id,
@@ -387,7 +605,144 @@ class TestForecastSwitchAdapter(unittest.IsolatedAsyncioTestCase):
 
         await self.adapter.start()
         self.assertGreaterEqual(call_count, 2)
-        self.mock_http.send_message.assert_called_once()
+        self.assertEqual(requested_start_from[0], "head")
+        self.assertEqual(requested_start_from[1], "1")
+        self.assertEqual(self.adapter.current_cursor, 2)
+
+    async def test_fatal_auth_error_terminates_cleanly(self) -> None:
+        """Non-recoverable authentication errors terminate adapter without infinite loop."""
+
+        async def auth_error_stream() -> AsyncGenerator[dict[str, Any], None]:
+            raise SwitchAuthError("4401 Unauthorized")
+            yield {}  # unreachable
+
+        self.adapter.ws_client = SwitchWebSocketClient(
+            self.config, stream_factory=auth_error_stream
+        )
+        await self.adapter.start()
+        self.assertFalse(self.adapter.is_running)
+
+    async def test_taken_over_eviction_terminates_cleanly(self) -> None:
+        """Connection displaced by another instance terminates without infinite loop."""
+
+        async def taken_over_stream() -> AsyncGenerator[dict[str, Any], None]:
+            raise SwitchEvictedError("Connection taken over", code="taken_over")
+            yield {}  # unreachable
+
+        self.adapter.ws_client = SwitchWebSocketClient(
+            self.config, stream_factory=taken_over_stream
+        )
+        await self.adapter.start()
+        self.assertFalse(self.adapter.is_running)
+
+    async def test_room_auto_discovery_and_claiming(self) -> None:
+        """Adapter without authorized_room_ids auto-discovers assigned rooms and claims them."""
+        open_config = SwitchAdapterConfig(
+            bridge_url="http://localhost:8000",
+            agent_id="test-agent",
+            api_key="secret",
+            authorized_room_ids=frozenset(),
+        )
+        mock_http = MagicMock()
+        mock_http.list_assigned_rooms = AsyncMock(
+            return_value=[{"room_id": "auto-discovered-room-1", "name": "General"}]
+        )
+
+        stream_called_with_rooms = None
+        adapter: ForecastSwitchAdapter | None = None
+
+        async def inspect_stream_factory() -> AsyncGenerator[dict[str, Any], None]:
+            yield {
+                "event": "connection_state",
+                "id": None,
+                "data": {
+                    "connection_id": open_config.connection_id,
+                    "generation": 1,
+                    "rooms": ["auto-discovered-room-1"],
+                    "cursor": 0,
+                },
+            }
+            if adapter is not None:
+                adapter.is_running = False
+
+        mock_ws = MagicMock()
+
+        async def mock_connect_events(
+            start_from: str | None = None, rooms: Any = None
+        ) -> AsyncGenerator[dict[str, Any], None]:
+            nonlocal stream_called_with_rooms
+            stream_called_with_rooms = rooms
+            async for frame in inspect_stream_factory():
+                yield frame
+
+        mock_ws.connect_events = mock_connect_events
+        mock_ws.close = AsyncMock()
+        mock_ws._custom_stream_factory = None
+
+        adapter = ForecastSwitchAdapter(
+            config=open_config,
+            http_client=mock_http,
+            ws_client=mock_ws,
+        )
+        await adapter.start()
+
+        mock_http.list_assigned_rooms.assert_awaited_once()
+        self.assertEqual(stream_called_with_rooms, ["auto-discovered-room-1"])
+        self.assertEqual(adapter.active_rooms, ["auto-discovered-room-1"])
+
+    async def test_inbound_mutation_rejection_variations(self) -> None:
+        """Any mutation command in chat is rejected without modifying simulator."""
+        mutation_queries = [
+            "@forecast-agent approve plan a",
+            "@forecast-agent execute",
+            "@forecast-agent apply mitigation",
+            "@forecast-agent kill workload",
+            "@forecast-agent throttle now",
+            "@forecast-agent mitigate immediately",
+            "@forecast-agent please execute the emergency plan",
+            "@forecast-agent approve",
+        ]
+        for query in mutation_queries:
+            reply = await self.adapter.handle_message_event(
+                {
+                    "type": "message",
+                    "room_id": "room-discord-main",
+                    "payload": {
+                        "addressed": True,
+                        "sender_name": "attacker",
+                        "body": query,
+                    },
+                }
+            )
+            self.assertIsNotNone(reply)
+            self.assertIn("Execution Denied", reply)
+            self.assertIn("SafetyGate", reply)
+            self.assertEqual(self.sim.core_temp_c, 72.0)
+
+    async def test_normal_throttle_query_preserved(self) -> None:
+        """Advisory 'throttle' and time-to-throttle queries are preserved and not rejected."""
+        advisory_queries = [
+            "@forecast-agent throttle",
+            "@forecast-agent time to throttle",
+            "@forecast-agent time to trip",
+            "@forecast-agent ttt",
+        ]
+        for query in advisory_queries:
+            reply = await self.adapter.handle_message_event(
+                {
+                    "type": "message",
+                    "room_id": "room-discord-main",
+                    "payload": {
+                        "addressed": True,
+                        "sender_name": "operator",
+                        "body": query,
+                    },
+                }
+            )
+            self.assertIsNotNone(reply)
+            self.assertNotIn("Execution Denied", reply)
+            self.assertIn("Time-to-Throttle", reply)
+            self.assertEqual(self.sim.core_temp_c, 72.0)
 
 
 if __name__ == "__main__":

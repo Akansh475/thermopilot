@@ -5,9 +5,12 @@ from thermopilot.switch_adapter.client import (
     SwitchAuthError,
     SwitchClientError,
     SwitchConflictError,
+    SwitchEvictedError,
     SwitchHttpClient,
     SwitchNotFoundError,
+    SwitchRefusedError,
     SwitchSSEClient,
+    SwitchWebSocketClient,
 )
 from thermopilot.switch_adapter.config import SwitchAdapterConfig
 
@@ -17,7 +20,10 @@ __all__ = [
     "SwitchAuthError",
     "SwitchClientError",
     "SwitchConflictError",
+    "SwitchEvictedError",
     "SwitchHttpClient",
     "SwitchNotFoundError",
+    "SwitchRefusedError",
     "SwitchSSEClient",
+    "SwitchWebSocketClient",
 ]

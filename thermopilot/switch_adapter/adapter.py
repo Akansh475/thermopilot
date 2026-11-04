@@ -9,6 +9,7 @@ Strictly Read-Only & Simulation Guarded:
 - Never mutates workloads or physical hardware.
 - Never bypasses SafetyGate.
 - Reuses ForecastAgent.observe() without duplicating forecast logic.
+- Uses Switch Agent Protocol WebSocket transport for duplex streaming.
 """
 
 from __future__ import annotations
@@ -26,21 +27,21 @@ from thermopilot.agents.forecast import (
 )
 from thermopilot.simulator.telemetry import TelemetrySimulator
 from thermopilot.switch_adapter.client import (
-    SwitchConflictError,
+    SwitchAuthError,
+    SwitchEvictedError,
     SwitchHttpClient,
     SwitchSSEClient,
+    SwitchWebSocketClient,
 )
 from thermopilot.switch_adapter.config import SwitchAdapterConfig
 
 logger = logging.getLogger(__name__)
 
-ADVISORY_FOOTER = (
-    "\n\n> 🛡️ **ThermoPilot Compute Desk** | *Advisory Only · Simulated Physics · Zero Hardware Actuation*"
-)
+ADVISORY_FOOTER = "\n\n> 🛡️ **ThermoPilot Compute Desk** | *Advisory Only · Simulated Physics · Zero Hardware Actuation*"
 
 
 class ForecastSwitchAdapter:
-    """Bridges Switch Agent Protocol rooms to the ThermoPilot ForecastAgent."""
+    """Bridges Switch Agent Protocol rooms to the ThermoPilot ForecastAgent via WebSocket."""
 
     def __init__(
         self,
@@ -48,18 +49,33 @@ class ForecastSwitchAdapter:
         forecast_agent: ForecastAgent | None = None,
         simulator: TelemetrySimulator | None = None,
         http_client: SwitchHttpClient | None = None,
+        ws_client: SwitchWebSocketClient | None = None,
         sse_client: SwitchSSEClient | None = None,
     ) -> None:
         self.config = config
         self.forecast_agent = forecast_agent or ForecastAgent(ForecastConfig())
         self.simulator = simulator or TelemetrySimulator()
         self.http_client = http_client or SwitchHttpClient(self.config)
-        self.sse_client = sse_client or SwitchSSEClient(self.config)
+        self.ws_client = ws_client or SwitchWebSocketClient(self.config)
+        self.sse_client = (
+            sse_client  # Maintained for backwards-compatible test fixtures
+        )
 
         self.is_running = False
-        self._heartbeat_task: asyncio.Task[None] | None = None
-        self._current_cursor: int | None = None
-        self._claimed_rooms: set[str] = set()
+        self.is_connected = False
+        self.current_cursor: int | None = None
+        self.connection_generation: int | None = None
+        self.active_rooms: list[str] = []
+        self.last_heartbeat_time: float = 0.0
+
+    @property
+    def _current_cursor(self) -> int | None:
+        """Backwards compatibility alias for cursor position."""
+        return self.current_cursor
+
+    @_current_cursor.setter
+    def _current_cursor(self, val: int | None) -> None:
+        self.current_cursor = val
 
     # -----------------------------------------------------------------------
     # Advisory Forecast Response Synthesis
@@ -165,29 +181,41 @@ class ForecastSwitchAdapter:
         """Route user query text to the corresponding advisory response generator."""
         clean_text = re.sub(r"@\S+", "", message_text).strip().lower()
 
-        if any(k in clean_text for k in ("help", "commands", "usage")):
-            return self.format_help_reply()
-
-        if any(k in clean_text for k in ("ttt", "time to trip", "time-to-trip", "countdown", "throttle")):
-            forecast = self.get_current_forecast()
-            return self.format_ttt_reply(forecast)
-
-        if any(k in clean_text for k in ("forecast", "trajectory", "predict", "derivative", "runaway")):
-            forecast = self.get_current_forecast()
-            return self.format_trajectory_reply(forecast)
-
-        if any(k in clean_text for k in ("status", "health", "temp", "temperature", "metrics")):
-            forecast = self.get_current_forecast()
-            return self.format_status_reply(forecast)
-
         # Defense-in-depth: Reject any attempt to trigger workload actions
-        if any(k in clean_text for k in ("approve", "execute", "apply", "kill", "throttle now", "mitigate")):
+        if any(
+            k in clean_text
+            for k in ("approve", "execute", "apply", "kill", "throttle now", "mitigate")
+        ):
             return (
                 "⚠️ **Execution Denied:** Workload actuation and plan execution cannot be triggered from chat. "
                 "In ThermoPilot Compute Desk, all mitigation proposals require deterministic SafetyGate "
                 "verification and authenticated operator sign-off at the governance desk."
                 + ADVISORY_FOOTER
             )
+
+        if any(k in clean_text for k in ("help", "commands", "usage")):
+            return self.format_help_reply()
+
+        if any(
+            k in clean_text
+            for k in ("ttt", "time to trip", "time-to-trip", "countdown", "throttle")
+        ):
+            forecast = self.get_current_forecast()
+            return self.format_ttt_reply(forecast)
+
+        if any(
+            k in clean_text
+            for k in ("forecast", "trajectory", "predict", "derivative", "runaway")
+        ):
+            forecast = self.get_current_forecast()
+            return self.format_trajectory_reply(forecast)
+
+        if any(
+            k in clean_text
+            for k in ("status", "health", "temp", "temperature", "metrics")
+        ):
+            forecast = self.get_current_forecast()
+            return self.format_status_reply(forecast)
 
         # Default fallback summary
         forecast = self.get_current_forecast()
@@ -199,7 +227,7 @@ class ForecastSwitchAdapter:
         return summary + ADVISORY_FOOTER
 
     async def handle_message_event(self, event_data: dict[str, Any]) -> str | None:
-        """Process an incoming Switch SSE domain event.
+        """Process an incoming Switch domain event.
 
         Enforces:
         - Must be event type 'message'.
@@ -234,7 +262,12 @@ class ForecastSwitchAdapter:
             return None
 
         body = payload.get("body", "")
-        logger.info("Received addressed message in room %s from %s: %r", room_id, sender_name, body)
+        logger.info(
+            "Received addressed message in room %s from %s: %r",
+            room_id,
+            sender_name,
+            body,
+        )
 
         reply_content = self.generate_advisory_reply(body)
 
@@ -247,86 +280,142 @@ class ForecastSwitchAdapter:
             raise
 
     # -----------------------------------------------------------------------
-    # Heartbeat Worker
-    # -----------------------------------------------------------------------
-
-    async def _heartbeat_worker(self) -> None:
-        """Maintain persistent connection liveness by beating every 2 seconds."""
-        logger.info("Starting Switch heartbeat worker (interval: %.1fs)", self.config.heartbeat_interval_s)
-        while self.is_running:
-            try:
-                await self.http_client.send_heartbeat(
-                    connection_id=self.config.connection_id,
-                    cursor=self._current_cursor,
-                )
-                logger.debug("Heartbeat acknowledged by Switch bridge")
-            except SwitchConflictError as exc:
-                logger.warning("Heartbeat conflict (stream displaced or connection not yet open): %s", exc)
-            except Exception as exc:  # noqa: BLE001 - resilience against network glitches
-                logger.warning("Heartbeat tick failed: %s", exc)
-
-            try:
-                await asyncio.sleep(self.config.heartbeat_interval_s)
-            except asyncio.CancelledError:
-                break
-        logger.info("Heartbeat worker terminated")
-
-    # -----------------------------------------------------------------------
     # Connection Lifecycle & Reconnect Handling
     # -----------------------------------------------------------------------
 
     async def start(self) -> None:
-        """Start the adapter, open the SSE event stream, and launch the heartbeat loop."""
+        """Start the adapter, open the WebSocket event stream, and process events."""
         self.is_running = True
-        self._heartbeat_task = asyncio.create_task(self._heartbeat_worker())
-
         reconnect_delay = self.config.reconnect_delay_s
 
+        # Resolve declared rooms to claim on connect
+        declared_rooms: list[str] = sorted(self.config.authorized_room_ids)
+        if not declared_rooms:
+            try:
+                assigned_rooms = await self.http_client.list_assigned_rooms()
+                declared_rooms = [
+                    r["room_id"]
+                    for r in assigned_rooms
+                    if isinstance(r, dict) and "room_id" in r
+                ]
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Could not pre-fetch assigned rooms: %s", exc)
+
         logger.info(
-            "Connecting ForecastSwitchAdapter (agent_id: %s, connection_id: %s)",
+            "Connecting ForecastSwitchAdapter via WebSocket (agent_id: %s, connection_id: %s, rooms: %s)",
             self.config.agent_id,
             self.config.connection_id,
+            declared_rooms,
         )
 
         while self.is_running:
+            start_from = (
+                str(self.current_cursor) if self.current_cursor is not None else "head"
+            )
             try:
-                async for frame in self.sse_client.connect_events(
-                    connection_id=self.config.connection_id
+                # If sse_client was provided explicitly for legacy test fixtures, use it;
+                # otherwise use current WebSocket transport.
+                if (
+                    self.sse_client is not None
+                    and self.ws_client._custom_stream_factory is None
                 ):
+                    stream = self.sse_client.connect_events(
+                        connection_id=self.config.connection_id,
+                        start_from=start_from,
+                    )
+                else:
+                    stream = self.ws_client.connect_events(
+                        start_from=start_from,
+                        rooms=declared_rooms if declared_rooms else None,
+                    )
+
+                async for frame in stream:
                     if not self.is_running:
                         break
 
-                    # Reset backoff upon receiving frames
+                    self.is_connected = True
                     reconnect_delay = self.config.reconnect_delay_s
 
-                    # Update cursor sequence if present
+                    event = frame.get("event")
                     seq = frame.get("id")
-                    if seq and seq.isdigit():
-                        self._current_cursor = int(seq)
+                    if seq is not None and str(seq).isdigit():
+                        self.current_cursor = int(seq)
 
-                    data = frame.get("data")
-                    if isinstance(data, dict):
-                        await self.handle_message_event(data)
+                    if event == "connection_state":
+                        st = frame.get("data", {})
+                        if isinstance(st, dict):
+                            self.connection_generation = st.get("generation")
+                            self.active_rooms = list(st.get("rooms", []))
+                            if st.get("cursor") is not None:
+                                self.current_cursor = int(st["cursor"])
+                        logger.info(
+                            "Switch WebSocket connection active (generation: %s, rooms: %s, cursor: %s)",
+                            self.connection_generation,
+                            self.active_rooms,
+                            self.current_cursor,
+                        )
+
+                    elif event == "ping":
+                        self.last_heartbeat_time = asyncio.get_running_loop().time()
+                        logger.debug(
+                            "Switch ping acknowledged (pong sent, cursor: %s)",
+                            self.current_cursor,
+                        )
+
+                    elif event == "message":
+                        data = frame.get("data")
+                        if isinstance(data, dict):
+                            await self.handle_message_event(data)
 
             except asyncio.CancelledError:
                 break
-            except Exception as exc:  # noqa: BLE001 - resilience against network drops
+            except SwitchAuthError as exc:
+                logger.error(
+                    "Non-recoverable authentication failure from Switch bridge: %s", exc
+                )
+                self.is_running = False
+                self.is_connected = False
+                break
+            except SwitchEvictedError as exc:
+                if exc.code == "taken_over":
+                    logger.warning(
+                        "Connection superseded/taken over by another instance: %s", exc
+                    )
+                    self.is_running = False
+                    self.is_connected = False
+                    break
+                logger.warning(
+                    "Connection evicted (%s). Reconnecting in %.1fs...",
+                    exc,
+                    reconnect_delay,
+                )
+                self.is_connected = False
                 if not self.is_running:
                     break
-                logger.warning("SSE stream disconnected (%s). Reconnecting in %.1fs...", exc, reconnect_delay)
                 await asyncio.sleep(reconnect_delay)
-                reconnect_delay = min(reconnect_delay * 1.5, self.config.max_reconnect_delay_s)
+                reconnect_delay = min(
+                    reconnect_delay * 1.5, self.config.max_reconnect_delay_s
+                )
+            except Exception as exc:  # noqa: BLE001 - resilience against network drops
+                self.is_connected = False
+                if not self.is_running:
+                    break
+                logger.warning(
+                    "Switch WebSocket disconnected (%s). Reconnecting in %.1fs (cursor: %s)...",
+                    exc,
+                    reconnect_delay,
+                    self.current_cursor,
+                )
+                await asyncio.sleep(reconnect_delay)
+                reconnect_delay = min(
+                    reconnect_delay * 1.5, self.config.max_reconnect_delay_s
+                )
 
         await self.stop()
 
     async def stop(self) -> None:
-        """Gracefully stop background tasks and close client connections."""
+        """Gracefully stop adapter and close WebSocket connection."""
         self.is_running = False
-        if self._heartbeat_task and not self._heartbeat_task.done():
-            self._heartbeat_task.cancel()
-            try:
-                await self._heartbeat_task
-            except asyncio.CancelledError:
-                pass
-            self._heartbeat_task = None
+        self.is_connected = False
+        await self.ws_client.close()
         logger.info("ForecastSwitchAdapter stopped cleanly")

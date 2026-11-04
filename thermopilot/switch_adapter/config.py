@@ -8,7 +8,9 @@ are never logged or serialized in plaintext.
 from __future__ import annotations
 
 import os
+import urllib.parse
 import uuid
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -96,6 +98,30 @@ class SwitchAdapterConfig(BaseModel):
             return True
         return room_id in self.authorized_room_ids
 
+    def build_ws_url(
+        self,
+        start_from: str | None = None,
+        rooms: Sequence[str] | frozenset[str] | None = None,
+    ) -> str:
+        """Construct the official Switch Agent Protocol WebSocket URL with query parameters."""
+        parsed = urlparse(self.bridge_url)
+        scheme = "wss" if parsed.scheme == "https" else "ws"
+        netloc = parsed.netloc
+
+        params: dict[str, str] = {
+            "connection_id": self.connection_id,
+            "scope": self.scope,
+            "filter": self.event_filter,
+            "start_from": start_from or "head",
+            "client": self.client_name,
+            "client_version": self.client_version,
+        }
+        if rooms:
+            params["rooms"] = ",".join(sorted(rooms))
+
+        query_str = urllib.parse.urlencode(params)
+        return f"{scheme}://{netloc}/agents/{self.agent_id}/connection/ws?{query_str}"
+
     def masked_api_key(self) -> str:
         """Safe masked representation of api_key for diagnostic logging."""
         if len(self.api_key) <= 8:
@@ -115,6 +141,7 @@ class SwitchAdapterConfig(BaseModel):
     @classmethod
     def from_env(
         cls,
+        env_file: Path | str | None = ".env",
         connection_id_file: Path | str | None = ".switch_connection_id",
         **overrides: Any,
     ) -> SwitchAdapterConfig:
@@ -128,9 +155,24 @@ class SwitchAdapterConfig(BaseModel):
         - SWITCH_AUTHORIZED_ROOM_IDS: Comma-separated list of permitted room IDs
         - SWITCH_HEARTBEAT_INTERVAL_S: Float seconds between beats (default: 2.0)
         """
-        bridge_url = os.environ.get("SWITCH_BRIDGE_URL", "http://localhost:8000")
-        agent_id = os.environ.get("SWITCH_AGENT_ID")
-        api_key = os.environ.get("SWITCH_API_KEY")
+        env_dict: dict[str, str] = {}
+        if env_file:
+            path = Path(env_file)
+            if path.exists():
+                try:
+                    for line in path.read_text().splitlines():
+                        line = line.strip()
+                        if line and not line.startswith("#") and "=" in line:
+                            k, v = line.split("=", 1)
+                            env_dict[k.strip()] = v.strip().strip("\"'")
+                except OSError:
+                    pass
+
+        bridge_url = os.environ.get("SWITCH_BRIDGE_URL") or env_dict.get(
+            "SWITCH_BRIDGE_URL", "http://localhost:8000"
+        )
+        agent_id = os.environ.get("SWITCH_AGENT_ID") or env_dict.get("SWITCH_AGENT_ID")
+        api_key = os.environ.get("SWITCH_API_KEY") or env_dict.get("SWITCH_API_KEY")
 
         if not agent_id and "agent_id" not in overrides:
             raise ValueError("SWITCH_AGENT_ID environment variable is required")
@@ -138,7 +180,9 @@ class SwitchAdapterConfig(BaseModel):
             raise ValueError("SWITCH_API_KEY environment variable is required")
 
         # Persistent connection ID resolution
-        conn_id = os.environ.get("SWITCH_CONNECTION_ID")
+        conn_id = os.environ.get("SWITCH_CONNECTION_ID") or env_dict.get(
+            "SWITCH_CONNECTION_ID"
+        )
         if not conn_id and connection_id_file:
             path = Path(connection_id_file)
             if path.exists():
@@ -155,14 +199,19 @@ class SwitchAdapterConfig(BaseModel):
                 except OSError:
                     pass
 
-        rooms_raw = os.environ.get("SWITCH_AUTHORIZED_ROOM_IDS", "")
+        rooms_raw = os.environ.get("SWITCH_AUTHORIZED_ROOM_IDS") or env_dict.get(
+            "SWITCH_AUTHORIZED_ROOM_IDS", ""
+        )
         authorized_rooms = (
             frozenset(r.strip() for r in rooms_raw.split(",") if r.strip())
             if rooms_raw
             else frozenset()
         )
 
-        heartbeat_s = float(os.environ.get("SWITCH_HEARTBEAT_INTERVAL_S", "2.0"))
+        heartbeat_s = float(
+            os.environ.get("SWITCH_HEARTBEAT_INTERVAL_S")
+            or env_dict.get("SWITCH_HEARTBEAT_INTERVAL_S", "2.0")
+        )
 
         data: dict[str, Any] = {
             "bridge_url": bridge_url,
